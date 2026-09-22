@@ -3,6 +3,7 @@ const POINTS_NAME = "Coins";
 const AD_REWARD_COINS = 10;
 const DAILY_AD_LIMIT = 10;
 const AD_COOLDOWN_SECONDS = 30;
+const MINI_APP_SHORT_NAME = "myapp";
 
 export default {
   async fetch(request, env) {
@@ -21,6 +22,7 @@ export default {
       }
 
       if (url.pathname === "/api/me") return await apiMe(request, env);
+      if (url.pathname === "/api/referral") return await apiReferral(request, env);
       if (url.pathname === "/api/reward-ad") return await rewardAd(request, env);
       if (url.pathname === "/monetag/postback") return await monetagPostback(request, env);
       if (url.pathname === "/api/offerwall/postback") return await offerwallPostback(request, env);
@@ -195,6 +197,87 @@ async function apiMe(request, env) {
       count: Number(referralCount?.count || 0)
     },
     transactions: transactions.results || []
+  });
+}
+
+async function apiReferral(request, env) {
+  if (request.method !== "GET") {
+    return json({ success: false, message: "Method not allowed." }, 405);
+  }
+
+  if (!env.DB || !env.BOT_TOKEN) {
+    return json({ success: false, message: "Server configuration is incomplete." }, 500);
+  }
+
+  const initData = getInitData(request);
+  if (!initData) {
+    return json({
+      success: false,
+      code: "MISSING_INIT_DATA",
+      message: "Telegram authorization data is missing."
+    }, 401);
+  }
+
+  const telegramData = await validateTelegramInitData(initData, env.BOT_TOKEN);
+  if (!telegramData) {
+    return json({
+      success: false,
+      code: "INVALID_INIT_DATA",
+      message: "Invalid Telegram authorization."
+    }, 401);
+  }
+
+  const telegramId = String(telegramData.user.id);
+  const user = await env.DB
+    .prepare("SELECT id, referral_code FROM users WHERE telegram_id = ? LIMIT 1")
+    .bind(telegramId)
+    .first();
+
+  if (!user || !user.referral_code) {
+    return json({ success: false, message: "User account is not ready yet." }, 404);
+  }
+
+  let botUsername = "";
+  try {
+    const response = await fetch("https://api.telegram.org/bot" + env.BOT_TOKEN + "/getMe", {
+      method: "GET",
+      headers: { "accept": "application/json" }
+    });
+    const result = await response.json();
+    if (result && result.ok && result.result && result.result.username) {
+      botUsername = String(result.result.username);
+    }
+  } catch (error) {
+    console.error("Telegram getMe error:", error);
+  }
+
+  if (!botUsername) {
+    return json({
+      success: false,
+      message: "Unable to determine the Telegram bot username right now."
+    }, 502);
+  }
+
+  const shortName = String(env.MINI_APP_SHORT_NAME || MINI_APP_SHORT_NAME).trim();
+  if (!shortName) {
+    return json({
+      success: false,
+      message: "MINI_APP_SHORT_NAME is not configured."
+    }, 500);
+  }
+
+  const link = "https://t.me/" + botUsername + "/" + encodeURIComponent(shortName) + "?startapp=" + encodeURIComponent(String(user.referral_code));
+
+  const referralCount = await env.DB
+    .prepare("SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ?")
+    .bind(user.id)
+    .first();
+
+  return json({
+    success: true,
+    code: String(user.referral_code),
+    link,
+    count: Number(referralCount?.count || 0)
   });
 }
 
@@ -825,7 +908,7 @@ function renderApp() {
   return APP_HTML;
 }
 
-const APP_HTML = String.raw`"<!doctype html>
+const APP_HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -868,6 +951,15 @@ body{background:var(--tg-theme-bg-color,#f5f7fb);color:var(--tg-theme-text-color
 .loading{min-height:100vh;display:flex;align-items:center;justify-content:center;font-size:14px;opacity:.6}
 .error{padding:30px 20px;text-align:center}
 button{font-family:inherit}
+.referral-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:30;display:flex;align-items:flex-end;justify-content:center;padding:16px}
+.referral-modal{width:100%;max-width:560px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#111827);border-radius:24px;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.25)}
+.referral-modal h3{margin:0 0 7px;font-size:20px}
+.referral-modal p{margin:0 0 15px;font-size:13px;opacity:.65;line-height:1.45}
+.referral-code{padding:12px 14px;border-radius:14px;background:rgba(127,127,127,.1);font-weight:800;letter-spacing:1px;text-align:center;margin-bottom:10px}
+.referral-link{font-size:11px;line-height:1.4;word-break:break-all;padding:11px 12px;border-radius:12px;background:rgba(127,127,127,.07);opacity:.75;margin-bottom:14px}
+.referral-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.referral-actions button{border:0;border-radius:14px;padding:13px;font-weight:800;cursor:pointer;background:#111827;color:#fff}
+.referral-actions .secondary{background:rgba(127,127,127,.12);color:inherit}
 .wall{position:fixed;inset:0;background:var(--tg-theme-bg-color,#f5f7fb);z-index:10;display:flex;flex-direction:column}
 .wall-head{height:54px;display:flex;align-items:center;padding:0 12px;border-bottom:1px solid rgba(127,127,127,.12);flex:none}
 .wall-head button{border:0;background:transparent;font-size:24px;padding:6px}
@@ -1183,18 +1275,109 @@ button{font-family:inherit}
   }
 
   window.openSection = function (section) {
-    const messages = {
-      referral: "Your referral system is being prepared.",
-      withdraw: "Withdrawal options will be added in the next stage."
-    };
-
-    const message = messages[section] || "Coming soon.";
-
-    if (tg && typeof tg.showAlert === "function") {
-      tg.showAlert(message);
-    } else {
-      alert(message);
+    if (section === "referral") {
+      openReferral();
+      return;
     }
+
+    if (section === "withdraw") {
+      showAlert("Withdrawal options will be added in the next stage.");
+      return;
+    }
+
+    showAlert("Coming soon.");
+  };
+
+  async function openReferral() {
+    const existing = document.getElementById("referralOverlay");
+    if (existing) existing.remove();
+
+    document.body.insertAdjacentHTML(
+      "beforeend",
+      '<div class="referral-overlay" id="referralOverlay" onclick="closeReferral(event)">' +
+        '<div class="referral-modal" onclick="event.stopPropagation()">' +
+          '<h3>👥 Invite Friends</h3>' +
+          '<p>Share your personal link. New users who open Coin Cove through your link are recorded as your referrals.</p>' +
+          '<div id="referralContent" style="text-align:center;opacity:.65;padding:14px 0">Loading your referral link...</div>' +
+        '</div>' +
+      '</div>'
+    );
+
+    try {
+      const initData = getInitData();
+      const response = await fetch("/api/referral", {
+        method: "GET",
+        headers: { "X-Telegram-Init-Data": initData },
+        cache: "no-store"
+      });
+
+      const data = await response.json();
+      const content = document.getElementById("referralContent");
+      if (!content) return;
+
+      if (!response.ok || !data.success) {
+        content.innerHTML = '<div style="padding:8px 0">' + escapeHtml(data.message || "Unable to create your referral link.") + '</div>';
+        return;
+      }
+
+      const link = String(data.link || "");
+      const code = String(data.code || "");
+      const count = Number(data.count || 0);
+
+      content.innerHTML =
+        '<div style="font-size:12px;opacity:.6;margin-bottom:7px">Your referral code</div>' +
+        '<div class="referral-code">' + escapeHtml(code) + '</div>' +
+        '<div style="font-size:12px;opacity:.6;margin:9px 0 6px">Your invite link</div>' +
+        '<div class="referral-link">' + escapeHtml(link) + '</div>' +
+        '<div style="font-size:12px;margin-bottom:14px"><b>' + count + '</b> friends invited</div>' +
+        '<div class="referral-actions">' +
+          '<button class="secondary" onclick="copyReferralLink()">📋 Copy Link</button>' +
+          '<button onclick="shareReferralLink()">📤 Share</button>' +
+        '</div>';
+
+      window.__coinCoveReferralLink = link;
+    } catch (error) {
+      console.error("Referral error:", error);
+      const content = document.getElementById("referralContent");
+      if (content) content.textContent = "Unable to load your referral link. Please try again.";
+    }
+  }
+
+  window.closeReferral = function (event) {
+    if (event && event.target && event.target.id !== "referralOverlay") return;
+    const overlay = document.getElementById("referralOverlay");
+    if (overlay) overlay.remove();
+  };
+
+  window.copyReferralLink = async function () {
+    const link = window.__coinCoveReferralLink || "";
+    if (!link) return;
+
+    try {
+      await navigator.clipboard.writeText(link);
+      showAlert("Referral link copied.");
+    } catch (error) {
+      showAlert(link);
+    }
+  };
+
+  window.shareReferralLink = function () {
+    const link = window.__coinCoveReferralLink || "";
+    if (!link) return;
+
+    const text = "Join Coin Cove and earn Coins with me!";
+    const shareUrl = "https://t.me/share/url?url=" + encodeURIComponent(link) + "&text=" + encodeURIComponent(text);
+
+    try {
+      if (tg && typeof tg.openTelegramLink === "function") {
+        tg.openTelegramLink(shareUrl);
+        return;
+      }
+    } catch (error) {
+      console.error("Telegram share error:", error);
+    }
+
+    window.open(shareUrl, "_blank");
   };
 
   function showError(message) {
