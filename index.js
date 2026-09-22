@@ -22,6 +22,7 @@ export default {
 
       if (url.pathname === "/api/me") return await apiMe(request, env);
       if (url.pathname === "/api/reward-ad") return await rewardAd(request, env);
+      if (url.pathname === "/monetag/postback") return await monetagPostback(request, env);
       if (url.pathname === "/api/offerwall/postback") return await offerwallPostback(request, env);
 
       return new Response(renderApp(), {
@@ -198,6 +199,9 @@ async function apiMe(request, env) {
 }
 
 async function rewardAd(request, env) {
+  // IMPORTANT:
+  // This endpoint does NOT credit Coins.
+  // Monetag server-side postback is the only source that credits rewarded ads.
   if (request.method !== "POST") {
     return json({ success: false, message: "Method not allowed." }, 405);
   }
@@ -210,133 +214,225 @@ async function rewardAd(request, env) {
   try {
     body = await request.json();
   } catch (error) {
-    return json({ success: false, code: "INVALID_JSON", message: "Invalid request body." }, 400);
+    return json({
+      success: false,
+      code: "INVALID_JSON",
+      message: "Invalid request body."
+    }, 400);
   }
 
-  const initData = typeof body?.initData === "string" ? body.initData.trim() : "";
+  const initData = typeof body?.initData === "string"
+    ? body.initData.trim()
+    : "";
+
   if (!initData) {
-    return json({ success: false, code: "MISSING_INIT_DATA", message: "Telegram authorization data is missing." }, 401);
+    return json({
+      success: false,
+      code: "MISSING_INIT_DATA",
+      message: "Telegram authorization data is missing."
+    }, 401);
   }
 
-  const telegramData = await validateTelegramInitData(initData, env.BOT_TOKEN);
+  const telegramData = await validateTelegramInitData(
+    initData,
+    env.BOT_TOKEN
+  );
+
   if (!telegramData) {
-    return json({ success: false, code: "INVALID_INIT_DATA", message: "Invalid Telegram authorization." }, 401);
+    return json({
+      success: false,
+      code: "INVALID_INIT_DATA",
+      message: "Invalid Telegram authorization."
+    }, 401);
   }
-
-  const telegramId = String(telegramData.user.id);
-  const now = Math.floor(Date.now() / 1000);
-  const today = new Date().toISOString().slice(0, 10);
-  const reward = AD_REWARD_COINS;
 
   await ensureAdRewardTable(env.DB);
 
-  const existingUser = await env.DB
+  const telegramId = String(telegramData.user.id);
+
+  const user = await env.DB
     .prepare("SELECT id FROM users WHERE telegram_id = ? LIMIT 1")
     .bind(telegramId)
     .first();
 
-  if (!existingUser) {
-    return json({ success: false, code: "USER_NOT_FOUND", message: "User account was not found." }, 404);
+  if (!user) {
+    return json({
+      success: false,
+      code: "USER_NOT_FOUND",
+      message: "User account was not found."
+    }, 404);
   }
 
+  return json({
+    success: true,
+    rewarded: 0,
+    pending: true,
+    message: "Ad completed. Waiting for Monetag server confirmation."
+  });
+}
+
+async function monetagPostback(request, env) {
+  if (request.method !== "GET") {
+    return new Response("Method not allowed", { status: 405 });
+  }
+
+  if (!env.DB) {
+    return new Response("database configuration error", { status: 500 });
+  }
+
+  const q = new URL(request.url).searchParams;
+
+  // Support both the macro names documented by Monetag and the
+  // event_type/reward_event_type names configured for this zone.
+  const ymid = (q.get("ymid") || "").trim();
+  const event = (q.get("event") || q.get("event_type") || "").trim().toLowerCase();
+  const rewardEventType = (q.get("reward_event_type") || "").trim().toLowerCase();
+  const zoneId = (q.get("zone_id") || "").trim();
+  const telegramId = (q.get("telegram_id") || "").trim();
+  const estimatedPriceRaw = q.get("estimated_price");
+
+  if (!ymid || !zoneId || !telegramId) {
+    return new Response("bad request", { status: 400 });
+  }
+
+  // Only accept callbacks from our Monetag zone.
+  if (zoneId !== "11766606") {
+    return new Response("invalid zone", { status: 403 });
+  }
+
+  // Monetag postbacks can be sent for different event types.
+  // The configured rewarded-ad postback should use an impression/view event.
+  // We accept the common impression/view names and also a reward_event_type
+  // when Monetag explicitly marks the callback as a reward event.
+  const acceptedEvents = new Set([
+    "impression",
+    "view",
+    "viewed",
+    "reward",
+    "rewarded"
+  ]);
+
+  const acceptedRewardEvents = new Set([
+    "reward",
+    "rewarded",
+    "impression",
+    "view",
+    "viewed"
+  ]);
+
+  const eventAccepted =
+    acceptedEvents.has(event) ||
+    (!event && acceptedRewardEvents.has(rewardEventType)) ||
+    acceptedRewardEvents.has(rewardEventType);
+
+  if (!eventAccepted) {
+    // Do not reward click-only/unknown callbacks.
+    return new Response("ignored", { status: 200 });
+  }
+
+  await ensureMonetagTable(env.DB);
+  await ensureAdRewardTable(env.DB);
+
+  const user = await env.DB
+    .prepare("SELECT id FROM users WHERE telegram_id = ? LIMIT 1")
+    .bind(telegramId)
+    .first();
+
+  if (!user) {
+    return new Response("unknown user", { status: 404 });
+  }
+
+  // ymid identifies the Monetag user/session in the postback; it is not
+  // necessarily unique per ad impression. Build an event fingerprint from
+  // the complete normalized query string so an exact retry is idempotent
+  // while the same user can still earn from later ads.
+  const eventKey = await sha256Hex(
+    Array.from(q.entries())
+      .sort(function (a, b) {
+        if (a[0] === b[0]) return a[1].localeCompare(b[1]);
+        return a[0].localeCompare(b[0]);
+      })
+      .map(function (entry) {
+        return entry[0] + "=" + entry[1];
+      })
+      .join("&")
+  );
+
+  const existing = await env.DB
+    .prepare("SELECT id FROM monetag_postbacks WHERE event_key = ? LIMIT 1")
+    .bind(eventKey)
+    .first();
+
+  if (existing) {
+    return new Response("ok", { status: 200 });
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const today = new Date().toISOString().slice(0, 10);
+  const reward = AD_REWARD_COINS;
+
+  const estimatedPrice =
+    estimatedPriceRaw === null || estimatedPriceRaw === ""
+      ? null
+      : Number(estimatedPriceRaw);
+
+  if (
+    estimatedPrice !== null &&
+    (!Number.isFinite(estimatedPrice) || estimatedPrice < 0)
+  ) {
+    return new Response("invalid estimated_price", { status: 400 });
+  }
+
+  // Enforce the same daily limit and cooldown on the server.
   const daily = await env.DB
-    .prepare("SELECT COUNT(*) AS count FROM ad_rewards WHERE user_id = ? AND reward_date = ?")
-    .bind(existingUser.id, today)
+    .prepare(
+      "SELECT COUNT(*) AS count FROM monetag_postbacks WHERE telegram_id = ? AND reward_date = ?"
+    )
+    .bind(telegramId, today)
     .first();
 
   const dailyCount = Number(daily?.count || 0);
+
   if (dailyCount >= DAILY_AD_LIMIT) {
-    return json({
-      success: false,
-      code: "DAILY_LIMIT_REACHED",
-      message: `Daily ad limit reached (${DAILY_AD_LIMIT}).`,
-      rewarded: 0,
-      daily_count: dailyCount,
-      daily_limit: DAILY_AD_LIMIT
-    }, 429);
+    return new Response("daily limit reached", { status: 200 });
   }
 
-  const lastReward = await env.DB
-    .prepare("SELECT created_at FROM ad_rewards WHERE user_id = ? ORDER BY id DESC LIMIT 1")
-    .bind(existingUser.id)
+  const last = await env.DB
+    .prepare(
+      "SELECT created_at FROM monetag_postbacks WHERE telegram_id = ? ORDER BY id DESC LIMIT 1"
+    )
+    .bind(telegramId)
     .first();
 
-  const lastCreated = Number(lastReward?.created_at || 0);
+  const lastCreated = Number(last?.created_at || 0);
+
   if (lastCreated && now - lastCreated < AD_COOLDOWN_SECONDS) {
-    const wait = AD_COOLDOWN_SECONDS - (now - lastCreated);
-    return json({
-      success: false,
-      code: "AD_COOLDOWN",
-      message: `Please wait ${wait} seconds before watching another ad.`,
-      rewarded: 0,
-      retry_after: wait
-    }, 429);
-  }
-
-  const rewardId = crypto.randomUUID();
-
-  let inserted = false;
-  try {
-    const insertResult = await env.DB.prepare(`
-      INSERT INTO ad_rewards
-      (reward_id, user_id, reward_date, amount, created_at)
-      SELECT ?, ?, ?, ?, ?
-      WHERE
-        (SELECT COUNT(*) FROM ad_rewards WHERE user_id = ? AND reward_date = ?) < ?
-        AND (
-          (SELECT COALESCE(MAX(created_at), 0) FROM ad_rewards WHERE user_id = ?) = 0
-          OR ? - (SELECT COALESCE(MAX(created_at), 0) FROM ad_rewards WHERE user_id = ?) >= ?
-        )
-    `).bind(
-      rewardId,
-      existingUser.id,
-      today,
-      reward,
-      now,
-      existingUser.id,
-      today,
-      DAILY_AD_LIMIT,
-      existingUser.id,
-      now,
-      existingUser.id,
-      AD_COOLDOWN_SECONDS
-    ).run();
-
-    inserted = Number(insertResult?.meta?.changes || 0) === 1;
-  } catch (error) {
-    console.error("Rewarded ad claim error:", error);
-    return json({ success: false, code: "REWARD_CLAIM_FAILED", message: "Unable to claim the ad reward." }, 500);
-  }
-
-  if (!inserted) {
-    const currentDaily = await env.DB
-      .prepare("SELECT COUNT(*) AS count FROM ad_rewards WHERE user_id = ? AND reward_date = ?")
-      .bind(existingUser.id, today)
-      .first();
-
-    const count = Number(currentDaily?.count || 0);
-    if (count >= DAILY_AD_LIMIT) {
-      return json({
-        success: false,
-        code: "DAILY_LIMIT_REACHED",
-        message: `Daily ad limit reached (${DAILY_AD_LIMIT}).`,
-        rewarded: 0,
-        daily_count: count,
-        daily_limit: DAILY_AD_LIMIT
-      }, 429);
-    }
-
-    return json({
-      success: false,
-      code: "AD_COOLDOWN",
-      message: `Please wait ${AD_COOLDOWN_SECONDS} seconds before watching another ad.`,
-      rewarded: 0,
-      retry_after: AD_COOLDOWN_SECONDS
-    }, 429);
+    return new Response("cooldown", { status: 200 });
   }
 
   try {
+    // Insert the postback and credit the wallet in one D1 batch.
+    // If any statement fails, the batch is not considered successful.
     await env.DB.batch([
+      env.DB.prepare(`
+        INSERT INTO monetag_postbacks
+        (event_key, ymid, telegram_id, user_id, event_type, reward_event_type,
+         zone_id, estimated_price, reward_date, rewarded, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        eventKey,
+        ymid,
+        telegramId,
+        user.id,
+        event || null,
+        rewardEventType || null,
+        zoneId,
+        estimatedPrice,
+        today,
+        reward,
+        now
+      ),
+
       env.DB.prepare(`
         UPDATE wallets
         SET
@@ -344,42 +440,58 @@ async function rewardAd(request, env) {
           lifetime_earned = lifetime_earned + ?,
           updated_at = ?
         WHERE user_id = ?
-      `).bind(reward, reward, now, existingUser.id),
+      `).bind(reward, reward, now, user.id),
+
       env.DB.prepare(`
         INSERT INTO transactions
         (user_id, type, amount, description, created_at)
         VALUES (?, ?, ?, ?, ?)
       `).bind(
-        existingUser.id,
-        "ad_reward",
+        user.id,
+        "monetag_ad_reward",
         reward,
-        "Rewarded ad",
+        "Monetag rewarded ad",
         now
       )
     ]);
-  } catch (error) {
-    console.error("Rewarded ad wallet update failed:", error);
 
-    try {
-      await env.DB.prepare("DELETE FROM ad_rewards WHERE reward_id = ?").bind(rewardId).run();
-    } catch (cleanupError) {
-      console.error("Rewarded ad cleanup failed:", cleanupError);
+    return new Response("ok", { status: 200 });
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase();
+
+    // A duplicate ymid can happen if Monetag retries the same postback.
+    // It is already safely credited or being processed, so acknowledge it.
+    if (message.includes("unique") || message.includes("constraint")) {
+      return new Response("ok", { status: 200 });
     }
 
-    return json({
-      success: false,
-      code: "REWARD_SAVE_FAILED",
-      message: "The ad was completed, but the reward could not be saved."
-    }, 500);
+    console.error("Monetag postback error:", error);
+    return new Response("server error", { status: 500 });
   }
+}
 
-  return json({
-    success: true,
-    message: `You earned ${reward} ${POINTS_NAME}.`,
-    rewarded: reward,
-    daily_count: dailyCount + 1,
-    daily_limit: DAILY_AD_LIMIT
-  });
+async function ensureMonetagTable(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS monetag_postbacks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_key TEXT NOT NULL UNIQUE,
+      ymid TEXT NOT NULL,
+      telegram_id TEXT NOT NULL,
+      user_id INTEGER NOT NULL,
+      event_type TEXT,
+      reward_event_type TEXT,
+      zone_id TEXT NOT NULL,
+      estimated_price REAL,
+      reward_date TEXT NOT NULL,
+      rewarded INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `).run();
+
+  await db.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_monetag_postbacks_user_date
+    ON monetag_postbacks(telegram_id, reward_date)
+  `).run();
 }
 
 async function ensureAdRewardTable(db) {
@@ -664,6 +776,19 @@ async function hmacHexText(secret, message) {
   );
 }
 
+async function sha256Hex(message) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(message)
+  );
+
+  return Array.from(new Uint8Array(digest))
+    .map(function (byte) {
+      return byte.toString(16).padStart(2, "0");
+    })
+    .join("");
+}
+
 function constantTimeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
   if (a.length !== b.length) return false;
@@ -699,4 +824,33 @@ function renderApp() {
   return APP_HTML;
 }
 
-const APP_HTML = "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover\">\n<title>Coin Cove</title>\n<script src=\"https://telegram.org/js/telegram-web-app.js\"></script>\n<script src=\"https://libtl.com/sdk.js\" data-zone=\"11766606\" data-sdk=\"show_11766606\"></script>\n<style>\n*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}\nhtml,body{margin:0;min-height:100%;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Arial,sans-serif}\nbody{background:var(--tg-theme-bg-color,#f5f7fb);color:var(--tg-theme-text-color,#111827)}\n.app{max-width:560px;margin:auto;min-height:100vh;padding:calc(18px + env(safe-area-inset-top)) 16px calc(90px + env(safe-area-inset-bottom))}\n.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}\n.brand{display:flex;align-items:center;gap:10px}\n.logo{width:44px;height:44px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:24px;background:#111827;color:#fff}\n.brand-title{font-size:20px;font-weight:800}\n.brand-subtitle{font-size:12px;opacity:.55;margin-top:2px}\n.profile{width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(127,127,127,.12);font-weight:700}\n.balance-card{border-radius:24px;padding:24px;background:#111827;color:#fff;margin-bottom:18px;box-shadow:0 12px 30px rgba(0,0,0,.12)}\n.balance-label{font-size:13px;opacity:.65}\n.balance{font-size:38px;font-weight:850;margin-top:6px;letter-spacing:-1px}\n.balance-name{font-size:13px;opacity:.65;margin-top:2px}\n.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}\n.card{border:0;border-radius:20px;padding:20px 16px;text-align:left;background:var(--tg-theme-secondary-bg-color,#fff);color:var(--tg-theme-text-color,#111827);box-shadow:0 5px 18px rgba(0,0,0,.05);cursor:pointer}\n.card:active{transform:scale(.98)}\n.icon{font-size:27px;margin-bottom:12px}\n.card-title{font-size:15px;font-weight:800}\n.card-text{font-size:12px;opacity:.55;margin-top:5px;line-height:1.4}\n.section{margin-top:24px}\n.section-title{font-size:17px;font-weight:800;margin-bottom:12px}\n.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}\n.stat{background:var(--tg-theme-secondary-bg-color,#fff);border-radius:18px;padding:16px}\n.stat-number{font-size:20px;font-weight:800}\n.stat-label{font-size:11px;opacity:.55;margin-top:4px}\n.bottom{position:fixed;left:0;right:0;bottom:0;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:rgba(245,247,251,.9);backdrop-filter:blur(14px)}\n.bottom-inner{max-width:560px;margin:auto;display:grid;grid-template-columns:repeat(4,1fr);gap:7px}\n.nav{border:0;background:transparent;color:var(--tg-theme-hint-color,#6b7280);padding:8px 2px;border-radius:12px;font-size:11px;cursor:pointer}\n.nav-icon{display:block;font-size:20px;margin-bottom:3px}\n.nav.active{color:var(--tg-theme-text-color,#111827);font-weight:800}\n.loading{min-height:100vh;display:flex;align-items:center;justify-content:center;font-size:14px;opacity:.6}\n.error{padding:30px 20px;text-align:center}\nbutton{font-family:inherit}\n.wall{position:fixed;inset:0;background:var(--tg-theme-bg-color,#f5f7fb);z-index:10;display:flex;flex-direction:column}\n.wall-head{height:54px;display:flex;align-items:center;padding:0 12px;border-bottom:1px solid rgba(127,127,127,.12);flex:none}\n.wall-head button{border:0;background:transparent;font-size:24px;padding:6px}\n.wall-title{font-weight:800;margin-left:4px}\n.wall-frame{width:100%;height:calc(100% - 54px);border:0;flex:1}\n</style>\n</head>\n<body>\n<div id=\"app\"><div class=\"loading\">Loading Coin Cove...</div></div>\n\n<script>\n(function () {\n  const tg = window.Telegram && window.Telegram.WebApp;\n\n  if (tg) {\n    try {\n      tg.ready();\n      tg.expand();\n      if (tg.themeParams && tg.themeParams.bg_color) {\n        tg.setHeaderColor(tg.themeParams.bg_color);\n      }\n    } catch (e) {\n      console.error(\"Telegram WebApp init error:\", e);\n    }\n  }\n\n  let currentUser = null;\n\n  function getInitData() {\n    if (tg && typeof tg.initData === \"string\" && tg.initData.trim()) {\n      return tg.initData.trim();\n    }\n\n    return \"\";\n  }\n\n  async function loadApp() {\n    const initData = getInitData();\n\n    if (!initData) {\n      showError(\n        \"Open Coin Cove from the Telegram bot. Direct browser access does not provide Telegram authorization data.\"\n      );\n      return;\n    }\n\n    try {\n      const response = await fetch(\"/api/me\", {\n        method: \"GET\",\n        headers: {\n          \"X-Telegram-Init-Data\": initData\n        },\n        cache: \"no-store\"\n      });\n\n      const data = await response.json();\n\n      if (!response.ok || !data.success) {\n        console.error(\"API /api/me:\", data);\n        showError(data.message || \"Unable to load your account.\");\n        return;\n      }\n\n      currentUser = data.user;\n      render(data);\n    } catch (error) {\n      console.error(\"loadApp error:\", error);\n      showError(\"Unable to connect to Coin Cove.\");\n    }\n  }\n\n  function render(data) {\n    const user = data.user || {};\n    const wallet = data.wallet || {};\n    const referrals = data.referrals || {};\n\n    const first = escapeHtml(user.first_name || \"there\");\n    const initial = escapeHtml(\n      (user.first_name || \"C\").charAt(0).toUpperCase()\n    );\n\n    const balance = Number(wallet.balance || 0).toLocaleString();\n    const earned = Number(wallet.lifetime_earned || 0).toLocaleString();\n\n    const transactions = Array.isArray(data.transactions)\n      ? data.transactions\n      : [];\n\n    const activity = transactions.length\n      ? transactions.map(function (tx) {\n          const amount = Number(tx.amount || 0);\n\n          return (\n            '<div style=\"display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid rgba(127,127,127,.12)\">' +\n              '<div>' +\n                '<div style=\"font-weight:700;font-size:13px\">' +\n                  escapeHtml(tx.description || tx.type || \"Transaction\") +\n                '</div>' +\n                '<div style=\"font-size:10px;opacity:.5\">' +\n                  formatDate(tx.created_at) +\n                '</div>' +\n              '</div>' +\n              '<div style=\"font-weight:800\">' +\n                (amount > 0 ? \"+\" : \"\") +\n                escapeHtml(String(amount)) +\n              '</div>' +\n            '</div>'\n          );\n        }).join(\"\")\n      : '<div style=\"text-align:center;opacity:.5;padding:15px\">No activity yet</div>';\n\n    document.getElementById(\"app\").innerHTML =\n      '<div class=\"app\">' +\n        '<div class=\"header\">' +\n          '<div class=\"brand\">' +\n            '<div class=\"logo\">🪙</div>' +\n            '<div>' +\n              '<div class=\"brand-title\">Coin Cove</div>' +\n              '<div class=\"brand-subtitle\">Earn • Complete • Reward</div>' +\n            '</div>' +\n          '</div>' +\n          '<div class=\"profile\">' + initial + '</div>' +\n        '</div>' +\n\n        '<div class=\"balance-card\">' +\n          '<div class=\"balance-label\">Welcome back, ' + first + '</div>' +\n          '<div class=\"balance\">' + balance + '</div>' +\n          '<div class=\"balance-name\">Coins</div>' +\n        '</div>' +\n\n        '<div class=\"grid\">' +\n          '<button class=\"card\" onclick=\"openOffers()\">' +\n            '<div class=\"icon\">🎁</div>' +\n            '<div class=\"card-title\">Earn Offers</div>' +\n            '<div class=\"card-text\">Complete offers and earn Coins</div>' +\n          '</button>' +\n\n          '<button class=\"card\" onclick=\"watchAd()\">' +\n            '<div class=\"icon\">📺</div>' +\n            '<div class=\"card-title\">Watch & Earn</div>' +\n            '<div class=\"card-text\">Watch limited rewarded ads</div>' +\n          '</button>' +\n\n          '<button class=\"card\" onclick=\"openSection(\\'referral\\')\">' +\n            '<div class=\"icon\">👥</div>' +\n            '<div class=\"card-title\">Invite Friends</div>' +\n            '<div class=\"card-text\">Invite friends and earn</div>' +\n          '</button>' +\n\n          '<button class=\"card\" onclick=\"openSection(\\'withdraw\\')\">' +\n            '<div class=\"icon\">💸</div>' +\n            '<div class=\"card-title\">Withdraw</div>' +\n            '<div class=\"card-text\">Request your reward</div>' +\n          '</button>' +\n        '</div>' +\n\n        '<div class=\"section\">' +\n          '<div class=\"section-title\">Your Activity</div>' +\n          '<div class=\"stats\">' +\n            '<div class=\"stat\">' +\n              '<div class=\"stat-number\">' + earned + '</div>' +\n              '<div class=\"stat-label\">Lifetime Earned</div>' +\n            '</div>' +\n            '<div class=\"stat\">' +\n              '<div class=\"stat-number\">' + Number(referrals.count || 0) + '</div>' +\n              '<div class=\"stat-label\">Friends Invited</div>' +\n            '</div>' +\n          '</div>' +\n        '</div>' +\n\n        '<div class=\"section\">' +\n          '<div class=\"section-title\">Recent Activity</div>' +\n          '<div class=\"stat\">' + activity + '</div>' +\n        '</div>' +\n      '</div>' +\n\n      '<div class=\"bottom\">' +\n        '<div class=\"bottom-inner\">' +\n          '<button class=\"nav active\">' +\n            '<span class=\"nav-icon\">🏠</span>Home' +\n          '</button>' +\n          '<button class=\"nav\" onclick=\"openOffers()\">' +\n            '<span class=\"nav-icon\">🎁</span>Offers' +\n          '</button>' +\n          '<button class=\"nav\" onclick=\"openSection(\\'referral\\')\">' +\n            '<span class=\"nav-icon\">👥</span>Invite' +\n          '</button>' +\n          '<button class=\"nav\" onclick=\"openSection(\\'withdraw\\')\">' +\n            '<span class=\"nav-icon\">💰</span>Wallet' +\n          '</button>' +\n        '</div>' +\n      '</div>';\n  }\n\n  window.openOffers = function () {\n    if (!currentUser || !currentUser.telegram_id) {\n      showError(\"User account is not ready.\");\n      return;\n    }\n\n    const uid = encodeURIComponent(String(currentUser.telegram_id));\n\n    const wall =\n      \"https://offerwall.gg/wall/4c826098db679c99583194371d0eae1b?userId=\" +\n      uid;\n\n    const existing = document.getElementById(\"offerWall\");\n    if (existing) existing.remove();\n\n    document.body.insertAdjacentHTML(\n      \"beforeend\",\n      '<div class=\"wall\" id=\"offerWall\">' +\n        '<div class=\"wall-head\">' +\n          '<button onclick=\"closeOffers()\">‹</button>' +\n          '<div class=\"wall-title\">Earn Offers</div>' +\n        '</div>' +\n        '<iframe class=\"wall-frame\" src=\"' + escapeAttribute(wall) + '\" title=\"Coin Cove Offers\"></iframe>' +\n      '</div>'\n    );\n  };\n\n  window.closeOffers = function () {\n    const wall = document.getElementById(\"offerWall\");\n    if (wall) wall.remove();\n  };\n\n  let adBusy = false;\n\n  window.watchAd = async function () {\n    if (adBusy) return;\n\n    if (!tg || !tg.initData) {\n      showAlert(\"Open Coin Cove from Telegram to watch rewarded ads.\");\n      return;\n    }\n\n    if (typeof window.show_11766606 !== \"function\") {\n      showAlert(\"The ad service is not ready yet. Please try again in a moment.\");\n      return;\n    }\n\n    adBusy = true;\n\n    try {\n      await window.show_11766606();\n\n      const response = await fetch(\"/api/reward-ad\", {\n        method: \"POST\",\n        headers: {\n          \"Content-Type\": \"application/json\",\n          \"Cache-Control\": \"no-cache\"\n        },\n        body: JSON.stringify({ initData: tg.initData }),\n        cache: \"no-store\"\n      });\n\n      const data = await response.json();\n\n      if (!response.ok || !data.success) {\n        showAlert(data.message || \"The ad was completed, but the reward could not be added.\");\n        return;\n      }\n\n      showAlert(\"🎉 +\" + data.rewarded + \" Coins added!\\nToday: \" + data.daily_count + \"/\" + data.daily_limit);\n      await loadApp();\n    } catch (error) {\n      console.error(\"Monetag rewarded ad error:\", error);\n      showAlert(\"The ad was not completed. No Coins were added.\");\n    } finally {\n      adBusy = false;\n    }\n  };\n\n  function showAlert(message) {\n    if (tg && typeof tg.showAlert === \"function\") {\n      tg.showAlert(message);\n    } else {\n      alert(message);\n    }\n  }\n\n  window.openSection = function (section) {\n    const messages = {\n      referral: \"Your referral system is being prepared.\",\n      withdraw: \"Withdrawal options will be added in the next stage.\"\n    };\n\n    const message = messages[section] || \"Coming soon.\";\n\n    if (tg && typeof tg.showAlert === \"function\") {\n      tg.showAlert(message);\n    } else {\n      alert(message);\n    }\n  };\n\n  function showError(message) {\n    document.getElementById(\"app\").innerHTML =\n      '<div class=\"error\">' +\n        '<div style=\"font-size:48px\">🪙</div>' +\n        '<h2>Coin Cove</h2>' +\n        '<p style=\"opacity:.6\">' + escapeHtml(message) + '</p>' +\n        '<button onclick=\"location.reload()\" style=\"padding:10px 16px;border:0;border-radius:10px\">Retry</button>' +\n      '</div>';\n  }\n\n  function escapeHtml(value) {\n    return String(value == null ? \"\" : value)\n      .replaceAll(\"&\", \"&amp;\")\n      .replaceAll(\"<\", \"&lt;\")\n      .replaceAll(\">\", \"&gt;\")\n      .replaceAll('\"', \"&quot;\")\n      .replaceAll(\"'\", \"&#039;\");\n  }\n\n  function escapeAttribute(value) {\n    return escapeHtml(value);\n  }\n\n  function formatDate(timestamp) {\n    if (!timestamp) return \"\";\n    return new Date(Number(timestamp) * 1000).toLocaleDateString();\n  }\n\n  loadApp();\n})();\n</script>\n</body>\n</html>";
+const APP_HTML = "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover\">\n<title>Coin Cove</title>\n<script src=\"https://telegram.org/js/telegram-web-app.js\"></script>\n<script src=\"https://libtl.com/sdk.js\" data-zone=\"11766606\" data-sdk=\"show_11766606\"></script>\n<style>\n*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}\nhtml,body{margin:0;min-height:100%;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Arial,sans-serif}\nbody{background:var(--tg-theme-bg-color,#f5f7fb);color:var(--tg-theme-text-color,#111827)}\n.app{max-width:560px;margin:auto;min-height:100vh;padding:calc(18px + env(safe-area-inset-top)) 16px calc(90px + env(safe-area-inset-bottom))}\n.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}\n.brand{display:flex;align-items:center;gap:10px}\n.logo{width:44px;height:44px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:24px;background:#111827;color:#fff}\n.brand-title{font-size:20px;font-weight:800}\n.brand-subtitle{font-size:12px;opacity:.55;margin-top:2px}\n.profile{width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(127,127,127,.12);font-weight:700}\n.balance-card{border-radius:24px;padding:24px;background:#111827;color:#fff;margin-bottom:18px;box-shadow:0 12px 30px rgba(0,0,0,.12)}\n.balance-label{font-size:13px;opacity:.65}\n.balance{font-size:38px;font-weight:850;margin-top:6px;letter-spacing:-1px}\n.balance-name{font-size:13px;opacity:.65;margin-top:2px}\n.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}\n.card{border:0;border-radius:20px;padding:20px 16px;text-align:left;background:var(--tg-theme-secondary-bg-color,#fff);color:var(--tg-theme-text-color,#111827);box-shadow:0 5px 18px rgba(0,0,0,.05);cursor:pointer}\n.card:active{transform:scale(.98)}\n.icon{font-size:27px;margin-bottom:12px}\n.card-title{font-size:15px;font-weight:800}\n.card-text{font-size:12px;opacity:.55;margin-top:5px;line-height:1.4}\n.section{margin-top:24px}\n.section-title{font-size:17px;font-weight:800;margin-bottom:12px}\n.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}\n.stat{background:var(--tg-theme-secondary-bg-color,#fff);border-radius:18px;padding:16px}\n.stat-number{font-size:20px;font-weight:800}\n.stat-label{font-size:11px;opacity:.55;margin-top:4px}\n.bottom{position:fixed;left:0;right:0;bottom:0;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:rgba(245,247,251,.9);backdrop-filter:blur(14px)}\n.bottom-inner{max-width:560px;margin:auto;display:grid;grid-template-columns:repeat(4,1fr);gap:7px}\n.nav{border:0;background:transparent;color:var(--tg-theme-hint-color,#6b7280);padding:8px 2px;border-radius:12px;font-size:11px;cursor:pointer}\n.nav-icon{display:block;font-size:20px;margin-bottom:3px}\n.nav.active{color:var(--tg-theme-text-color,#111827);font-weight:800}\n.loading{min-height:100vh;display:flex;align-items:center;justify-content:center;font-size:14px;opacity:.6}\n.error{padding:30px 20px;text-align:center}\nbutton{font-family:inherit}\n.wall{position:fixed;inset:0;background:var(--tg-theme-bg-color,#f5f7fb);z-index:10;display:flex;flex-direction:column}\n.wall-head{height:54px;display:flex;align-items:center;padding:0 12px;border-bottom:1px solid rgba(127,127,127,.12);flex:none}\n.wall-head button{border:0;background:transparent;font-size:24px;padding:6px}\n.wall-title{font-weight:800;margin-left:4px}\n.wall-frame{width:100%;height:calc(100% - 54px);border:0;flex:1}\n</style>\n</head>\n<body>\n<div id=\"app\"><div class=\"loading\">Loading Coin Cove...</div></div>\n\n<script>\n(function () {\n  const tg = window.Telegram && window.Telegram.WebApp;\n\n  if (tg) {\n    try {\n      tg.ready();\n      tg.expand();\n      if (tg.themeParams && tg.themeParams.bg_color) {\n        tg.setHeaderColor(tg.themeParams.bg_color);\n      }\n    } catch (e) {\n      console.error(\"Telegram WebApp init error:\", e);\n    }\n  }\n\n  let currentUser = null;\n\n  function getInitData() {\n    if (tg && typeof tg.initData === \"string\" && tg.initData.trim()) {\n      return tg.initData.trim();\n    }\n\n    return \"\";\n  }\n\n  async function loadApp() {\n    const initData = getInitData();\n\n    if (!initData) {\n      showError(\n        \"Open Coin Cove from the Telegram bot. Direct browser access does not provide Telegram authorization data.\"\n      );\n      return;\n    }\n\n    try {\n      const response = await fetch(\"/api/me\", {\n        method: \"GET\",\n        headers: {\n          \"X-Telegram-Init-Data\": initData\n        },\n        cache: \"no-store\"\n      });\n\n      const data = await response.json();\n\n      if (!response.ok || !data.success) {\n        console.error(\"API /api/me:\", data);\n        showError(data.message || \"Unable to load your account.\");\n        return;\n      }\n\n      currentUser = data.user;\n      render(data);\n    } catch (error) {\n      console.error(\"loadApp error:\", error);\n      showError(\"Unable to connect to Coin Cove.\");\n    }\n  }\n\n  function render(data) {\n    const user = data.user || {};\n    const wallet = data.wallet || {};\n    const referrals = data.referrals || {};\n\n    const first = escapeHtml(user.first_name || \"there\");\n    const initial = escapeHtml(\n      (user.first_name || \"C\").charAt(0).toUpperCase()\n    );\n\n    const balance = Number(wallet.balance || 0).toLocaleString();\n    const earned = Number(wallet.lifetime_earned || 0).toLocaleString();\n\n    const transactions = Array.isArray(data.transactions)\n      ? data.transactions\n      : [];\n\n    const activity = transactions.length\n      ? transactions.map(function (tx) {\n          const amount = Number(tx.amount || 0);\n\n          return (\n            '<div style=\"display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid rgba(127,127,127,.12)\">' +\n              '<div>' +\n                '<div style=\"font-weight:700;font-size:13px\">' +\n                  escapeHtml(tx.description || tx.type || \"Transaction\") +\n                '</div>' +\n                '<div style=\"font-size:10px;opacity:.5\">' +\n                  formatDate(tx.created_at) +\n                '</div>' +\n              '</div>' +\n              '<div style=\"font-weight:800\">' +\n                (amount > 0 ? \"+\" : \"\") +\n                escapeHtml(String(amount)) +\n              '</div>' +\n            '</div>'\n          );\n        }).join(\"\")\n      : '<div style=\"text-align:center;opacity:.5;padding:15px\">No activity yet</div>';\n\n    document.getElementById(\"app\").innerHTML =\n      '<div class=\"app\">' +\n        '<div class=\"header\">' +\n          '<div class=\"brand\">' +\n            '<div class=\"logo\">🪙</div>' +\n            '<div>' +\n              '<div class=\"brand-title\">Coin Cove</div>' +\n              '<div class=\"brand-subtitle\">Earn • Complete • Reward</div>' +\n            '</div>' +\n          '</div>' +\n          '<div class=\"profile\">' + initial + '</div>' +\n        '</div>' +\n\n        '<div class=\"balance-card\">' +\n          '<div class=\"balance-label\">Welcome back, ' + first + '</div>' +\n          '<div class=\"balance\">' + balance + '</div>' +\n          '<div class=\"balance-name\">Coins</div>' +\n        '</div>' +\n\n        '<div class=\"grid\">' +\n          '<button class=\"card\" onclick=\"openOffers()\">' +\n            '<div class=\"icon\">🎁</div>' +\n            '<div class=\"card-title\">Earn Offers</div>' +\n            '<div class=\"card-text\">Complete offers and earn Coins</div>' +\n          '</button>' +\n\n          '<button class=\"card\" onclick=\"watchAd()\">' +\n            '<div class=\"icon\">📺</div>' +\n            '<div class=\"card-title\">Watch & Earn</div>' +\n            '<div class=\"card-text\">Watch limited rewarded ads</div>' +\n          '</button>' +\n\n          '<button class=\"card\" onclick=\"openSection(\\'referral\\')\">' +\n            '<div class=\"icon\">👥</div>' +\n            '<div class=\"card-title\">Invite Friends</div>' +\n            '<div class=\"card-text\">Invite friends and earn</div>' +\n          '</button>' +\n\n          '<button class=\"card\" onclick=\"openSection(\\'withdraw\\')\">' +\n            '<div class=\"icon\">💸</div>' +\n            '<div class=\"card-title\">Withdraw</div>' +\n            '<div class=\"card-text\">Request your reward</div>' +\n          '</button>' +\n        '</div>' +\n\n        '<div class=\"section\">' +\n          '<div class=\"section-title\">Your Activity</div>' +\n          '<div class=\"stats\">' +\n            '<div class=\"stat\">' +\n              '<div class=\"stat-number\">' + earned + '</div>' +\n              '<div class=\"stat-label\">Lifetime Earned</div>' +\n            '</div>' +\n            '<div class=\"stat\">' +\n              '<div class=\"stat-number\">' + Number(referrals.count || 0) + '</div>' +\n              '<div class=\"stat-label\">Friends Invited</div>' +\n            '</div>' +\n          '</div>' +\n        '</div>' +\n\n        '<div class=\"section\">' +\n          '<div class=\"section-title\">Recent Activity</div>' +\n          '<div class=\"stat\">' + activity + '</div>' +\n        '</div>' +\n      '</div>' +\n\n      '<div class=\"bottom\">' +\n        '<div class=\"bottom-inner\">' +\n          '<button class=\"nav active\">' +\n            '<span class=\"nav-icon\">🏠</span>Home' +\n          '</button>' +\n          '<button class=\"nav\" onclick=\"openOffers()\">' +\n            '<span class=\"nav-icon\">🎁</span>Offers' +\n          '</button>' +\n          '<button class=\"nav\" onclick=\"openSection(\\'referral\\')\">' +\n            '<span class=\"nav-icon\">👥</span>Invite' +\n          '</button>' +\n          '<button class=\"nav\" onclick=\"openSection(\\'withdraw\\')\">' +\n            '<span class=\"nav-icon\">💰</span>Wallet' +\n          '</button>' +\n        '</div>' +\n      '</div>';\n  }\n\n  window.openOffers = function () {\n    if (!currentUser || !currentUser.telegram_id) {\n      showError(\"User account is not ready.\");\n      return;\n    }\n\n    const uid = encodeURIComponent(String(currentUser.telegram_id));\n\n    const wall =\n      \"https://offerwall.gg/wall/4c826098db679c99583194371d0eae1b?userId=\" +\n      uid;\n\n    const existing = document.getElementById(\"offerWall\");\n    if (existing) existing.remove();\n\n    document.body.insertAdjacentHTML(\n      \"beforeend\",\n      '<div class=\"wall\" id=\"offerWall\">' +\n        '<div class=\"wall-head\">' +\n          '<button onclick=\"closeOffers()\">‹</button>' +\n          '<div class=\"wall-title\">Earn Offers</div>' +\n        '</div>' +\n        '<iframe class=\"wall-frame\" src=\"' + escapeAttribute(wall) + '\" title=\"Coin Cove Offers\"></iframe>' +\n      '</div>'\n    );\n  };\n\n  window.closeOffers = function () {\n    const wall = document.getElementById(\"offerWall\");\n    if (wall) wall.remove();\n  };\n\n  let adBusy = false;\n\n  window.watchAd = async function () {\n    if (adBusy) return;\n\n    if (!tg || !tg.initData) {\n      showAlert(\"Open Coin Cove from Telegram to watch rewarded ads.\");\n      return;\n    }\n\n    if (typeof window.show_11766606 !== \"function\") {\n      showAlert(\"The ad service is not ready yet. Please try again in a moment.\");\n      return;\n    }\n\n    adBusy = true;\n\n    try {\n      await window.show_11766606();\n\n      const response = await fetch(\"/api/reward-ad\", {\n        method: \"POST\",\n        headers: {\n          \"Content-Type\": \"application/json\",\n          \"Cache-Control\": \"no-cache\"\n        },\n        body: JSON.stringify({ initData: tg.initData }),\n        cache: \"no-store\"\n      });\n\n      const data = await response.json();\n\n      if (!response.ok || !data.success) {\n        showAlert(data.message || \"The ad was completed, but the reward could not be added.\");\n        return;\n      }\n\n      showAlert(\"🎉 +\" + data.rewarded + \" Coins added!\\nToday: \" + data.daily_count + \"/\" + data.daily_limit);\n      await loadApp();\n    } catch (error) {\n      console.error(\"Monetag rewarded ad error:\", error);\n      showAlert(\"The ad was not completed. No Coins were added.\");\n    } finally {\n      adBusy = false;\n    }\n  };\n\n  async function waitForMonetagReward() {
+    // The server-side Monetag postback is asynchronous.
+    // Refresh the account a few times so the user sees the reward when it arrives.
+    for (let i = 0; i < 6; i++) {
+      await new Promise(function (resolve) {
+        setTimeout(resolve, i === 0 ? 2000 : 3000);
+      });
+
+      try {
+        const initData = getInitData();
+        const response = await fetch("/api/me", {
+          method: "GET",
+          headers: {
+            "X-Telegram-Init-Data": initData
+          },
+          cache: "no-store"
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+          render(data);
+        }
+      } catch (error) {
+        console.error("Reward refresh error:", error);
+      }
+    }
+  }
+
+  function showAlert(message) {\n    if (tg && typeof tg.showAlert === \"function\") {\n      tg.showAlert(message);\n    } else {\n      alert(message);\n    }\n  }\n\n  window.openSection = function (section) {\n    const messages = {\n      referral: \"Your referral system is being prepared.\",\n      withdraw: \"Withdrawal options will be added in the next stage.\"\n    };\n\n    const message = messages[section] || \"Coming soon.\";\n\n    if (tg && typeof tg.showAlert === \"function\") {\n      tg.showAlert(message);\n    } else {\n      alert(message);\n    }\n  };\n\n  function showError(message) {\n    document.getElementById(\"app\").innerHTML =\n      '<div class=\"error\">' +\n        '<div style=\"font-size:48px\">🪙</div>' +\n        '<h2>Coin Cove</h2>' +\n        '<p style=\"opacity:.6\">' + escapeHtml(message) + '</p>' +\n        '<button onclick=\"location.reload()\" style=\"padding:10px 16px;border:0;border-radius:10px\">Retry</button>' +\n      '</div>';\n  }\n\n  function escapeHtml(value) {\n    return String(value == null ? \"\" : value)\n      .replaceAll(\"&\", \"&amp;\")\n      .replaceAll(\"<\", \"&lt;\")\n      .replaceAll(\">\", \"&gt;\")\n      .replaceAll('\"', \"&quot;\")\n      .replaceAll(\"'\", \"&#039;\");\n  }\n\n  function escapeAttribute(value) {\n    return escapeHtml(value);\n  }\n\n  function formatDate(timestamp) {\n    if (!timestamp) return \"\";\n    return new Date(Number(timestamp) * 1000).toLocaleDateString();\n  }\n\n  loadApp();\n})();\n</script>\n</body>\n</html>";
