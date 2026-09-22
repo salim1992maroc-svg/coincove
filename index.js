@@ -1,43 +1,59 @@
 export default {
   async fetch(request, env) {
-    try {
-      await env.DB.prepare(`
-        CREATE TABLE IF NOT EXISTS test_users (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL
-        )
-      `).run();
+    const tg = "https://telegram.org/js/telegram-web-app.js";
 
-      await env.DB.prepare(`
-        INSERT INTO test_users (name)
-        VALUES (?)
-      `).bind("Coin Cove Test").run();
+    return new Response(`<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Telegram Test</title>
+  <script src="${tg}"></script>
+</head>
+<body style="font-family:Arial;padding:20px">
+  <h2>Coin Cove - Telegram Test</h2>
 
-      const result = await env.DB
-        .prepare("SELECT * FROM test_users ORDER BY id DESC LIMIT 5")
-        .all();
+  <div id="result">Testing...</div>
 
-      return new Response(JSON.stringify({
-        success: true,
-        database: true,
-        message: "D1 READ/WRITE OK",
-        rows: result.results
-      }, null, 2), {
-        headers: {
-          "content-type": "application/json; charset=UTF-8"
-        }
-      });
+  <script>
+    const tg = window.Telegram && window.Telegram.WebApp;
+    const result = document.getElementById("result");
 
-    } catch (error) {
-      return new Response(JSON.stringify({
-        success: false,
-        error: String(error.message || error)
-      }, null, 2), {
-        status: 500,
-        headers: {
-          "content-type": "application/json; charset=UTF-8"
-        }
-      });
+    if (!tg) {
+      result.innerHTML = "<b>Telegram: NO</b>";
+    } else {
+      tg.ready();
+      tg.expand();
+
+      const hasInitData =
+        typeof tg.initData === "string" &&
+        tg.initData.length > 0;
+
+      const user =
+        tg.initDataUnsafe &&
+        tg.initDataUnsafe.user;
+
+      result.innerHTML =
+        "<p><b>Telegram:</b> YES</p>" +
+        "<p><b>initData:</b> " +
+        (hasInitData ? "YES" : "NO") +
+        "</p>" +
+        "<p><b>initData length:</b> " +
+        (tg.initData ? tg.initData.length : 0) +
+        "</p>" +
+        "<p><b>User:</b> " +
+        (user
+          ? user.first_name + " / ID " + user.id
+          : "NO USER") +
+        "</p>";
     }
+  </script>
+</body>
+</html>`, {
+      headers: {
+        "content-type": "text/html; charset=UTF-8",
+        "cache-control": "no-store"
+      }
+    });
   }
 };
