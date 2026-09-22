@@ -288,7 +288,7 @@ async function monetagPostback(request, env) {
   const event = (q.get("event") || q.get("event_type") || "").trim().toLowerCase();
   const rewardEventType = (q.get("reward_event_type") || "").trim().toLowerCase();
   const zoneId = (q.get("zone_id") || "").trim();
-  const telegramId = (q.get("telegram_id") || "").trim();
+  const telegramId = (q.get("telegram_id") || ymid).trim();
   const estimatedPriceRaw = q.get("estimated_price");
 
   if (!ymid || !zoneId || !telegramId) {
@@ -325,8 +325,9 @@ async function monetagPostback(request, env) {
     (!event && acceptedRewardEvents.has(rewardEventType)) ||
     acceptedRewardEvents.has(rewardEventType);
 
-  if (!eventAccepted) {
-    // Do not reward click-only/unknown callbacks.
+  // Monetag marks confirmed paid events as `valued`. Never credit an
+  // unpaid/non-valued event.
+  if (!eventAccepted || rewardEventType !== "valued") {
     return new Response("ignored", { status: 200 });
   }
 
@@ -1111,7 +1112,10 @@ button{font-family:inherit}
     adBusy = true;
 
     try {
-      await window.show_11766606();
+      await window.show_11766606({
+        ymid: String(currentUser.telegram_id),
+        requestVar: "watch_earn"
+      });
 
       const response = await fetch("/api/reward-ad", {
         method: "POST",
