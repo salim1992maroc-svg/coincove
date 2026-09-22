@@ -5,4 +5,4 @@ compatibility_date = "2026-09-22"
 [[d1_databases]]
 binding = "DB"
 database_name = "coin-cove-db"
-database_id = "ضع_DATABASE_ID_هنا"
+database_id = "2390f976-45b9-4e11-b58d-b3abd113fb1d"
