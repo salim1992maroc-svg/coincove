@@ -1,8 +1,12 @@
 export default {
   async fetch(request, env) {
-    return new Response("COIN COVE TEST OK", {
+    return new Response(JSON.stringify({
+      success: true,
+      app: "Coin Cove",
+      database: !!env.DB
+    }), {
       headers: {
-        "content-type": "text/plain; charset=UTF-8"
+        "content-type": "application/json; charset=UTF-8"
       }
     });
   }
