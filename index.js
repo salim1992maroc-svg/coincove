@@ -1339,22 +1339,22 @@ button{font-family:inherit}
     if (!IS_ADMIN) return showAlert("Admin access denied.");
     const old = document.getElementById("adminOverlay");
     if (old) old.remove();
-    document.body.insertAdjacentHTML("beforeend", `
-      <div class="admin-overlay" id="adminOverlay">
-        <div class="admin-box">
-          <div class="admin-head"><strong>🛡️ Coin Cove Admin</strong><button onclick="closeAdmin()">×</button></div>
-          <div class="admin-section">
-            <h3 style="margin:0 0 12px">Settings</h3>
-            <input class="admin-input" id="admCurrency" placeholder="Currency name" style="margin-bottom:8px">
-            <input class="admin-input" id="admReward" type="number" min="0" placeholder="Ad reward" style="margin-bottom:8px">
-            <input class="admin-input" id="admLimit" type="number" min="1" placeholder="Daily ad limit" style="margin-bottom:8px">
-            <input class="admin-input" id="admMethods" placeholder="bKash:200, Nagad:200" style="margin-bottom:8px">
-            <button class="admin-btn primary" onclick="saveAdminSettings()">Save settings</button>
-          </div>
-          <div class="admin-section"><h3 style="margin:0 0 10px">Users</h3><div id="adminUsers">Loading...</div></div>
-          <div class="admin-section"><h3 style="margin:0 0 10px">Withdrawals</h3><div id="adminWithdrawals">Loading...</div></div>
-        </div>
-      </div>`);
+    document.body.insertAdjacentHTML("beforeend",
+      '<div class="admin-overlay" id="adminOverlay">' +
+        '<div class="admin-box">' +
+          '<div class="admin-head"><strong>🛡️ Coin Cove Admin</strong><button onclick="closeAdmin()">×</button></div>' +
+          '<div class="admin-section">' +
+            '<h3 style="margin:0 0 12px">Settings</h3>' +
+            '<input class="admin-input" id="admCurrency" placeholder="Currency name" style="margin-bottom:8px">' +
+            '<input class="admin-input" id="admReward" type="number" min="0" placeholder="Ad reward" style="margin-bottom:8px">' +
+            '<input class="admin-input" id="admLimit" type="number" min="1" placeholder="Daily ad limit" style="margin-bottom:8px">' +
+            '<input class="admin-input" id="admMethods" placeholder="bKash:200, Nagad:200" style="margin-bottom:8px">' +
+            '<button class="admin-btn primary" onclick="saveAdminSettings()">Save settings</button>' +
+          '</div>' +
+          '<div class="admin-section"><h3 style="margin:0 0 10px">Users</h3><div id="adminUsers">Loading...</div></div>' +
+          '<div class="admin-section"><h3 style="margin:0 0 10px">Withdrawals</h3><div id="adminWithdrawals">Loading...</div></div>' +
+        '</div>' +
+      '</div>');
     await refreshAdmin();
   };
 
