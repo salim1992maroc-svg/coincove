@@ -1,0 +1,8 @@
+name = "coincove"
+main = "index.js"
+compatibility_date = "2026-09-22"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "coin-cove-db"
+database_id = "ضع_DATABASE_ID_هنا"
