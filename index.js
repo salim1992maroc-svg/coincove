@@ -1130,9 +1130,9 @@ button{font-family:inherit}
         return;
       }
 
-      showAlert("🎉 +" + data.rewarded + " Coins added!\
-Today: " + data.daily_count + "/" + data.daily_limit);
+      showAlert("✅ Ad completed. Waiting for Monetag confirmation...\nYour Coins will appear automatically after confirmation.");
       await loadApp();
+      await waitForMonetagReward();
     } catch (error) {
       console.error("Monetag rewarded ad error:", error);
       showAlert("The ad was not completed. No Coins were added.");
