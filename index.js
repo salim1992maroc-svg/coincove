@@ -26,6 +26,8 @@ export default {
       if (url.pathname === "/api/reward-ad") return await rewardAd(request, env);
       if (url.pathname === "/monetag/postback") return await monetagPostback(request, env);
       if (url.pathname === "/api/offerwall/postback") return await offerwallPostback(request, env);
+      if (url.pathname === "/api/admin") return await adminApi(request, env);
+      if (url.pathname === "/api/withdraw") return await withdrawApi(request, env);
 
       return new Response(renderApp(), {
         headers: {
@@ -196,7 +198,8 @@ async function apiMe(request, env) {
     referrals: {
       count: Number(referralCount?.count || 0)
     },
-    transactions: transactions.results || []
+    transactions: transactions.results || [],
+    isAdmin: String(env.ADMIN_CHAT_ID || "") === String(user.id)
   });
 }
 
@@ -416,6 +419,7 @@ async function monetagPostback(request, env) {
 
   await ensureMonetagTable(env.DB);
   await ensureAdRewardTable(env.DB);
+  const adminSettings = await getAdminSettings(env.DB);
 
   const user = await env.DB
     .prepare("SELECT id FROM users WHERE telegram_id = ? LIMIT 1")
@@ -453,7 +457,7 @@ async function monetagPostback(request, env) {
 
   const now = Math.floor(Date.now() / 1000);
   const today = new Date().toISOString().slice(0, 10);
-  const reward = AD_REWARD_COINS;
+  const reward = Number(adminSettings.adReward || AD_REWARD_COINS);
 
   const estimatedPrice =
     estimatedPriceRaw === null || estimatedPriceRaw === ""
@@ -477,7 +481,7 @@ async function monetagPostback(request, env) {
 
   const dailyCount = Number(daily?.count || 0);
 
-  if (dailyCount >= DAILY_AD_LIMIT) {
+  if (dailyCount >= Number(adminSettings.dailyAdLimit || DAILY_AD_LIMIT)) {
     return new Response("daily limit reached", { status: 200 });
   }
 
@@ -904,6 +908,167 @@ function json(data, status = 200) {
   });
 }
 
+async function ensureAdminTables(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `).run();
+
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      amount REAL NOT NULL,
+      method TEXT NOT NULL,
+      address TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'Pending',
+      created_at INTEGER NOT NULL,
+      processed_at INTEGER
+    )
+  `).run();
+
+  await db.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_withdrawals_user
+    ON withdrawals(user_id, id DESC)
+  `).run();
+}
+
+async function getAdminSettings(db) {
+  await ensureAdminTables(db);
+  const row = await db.prepare("SELECT value FROM app_settings WHERE key='config'").first();
+  const defaults = {
+    currency: "Coins",
+    adReward: AD_REWARD_COINS,
+    dailyAdLimit: DAILY_AD_LIMIT,
+    withdrawMethods: "bKash:200, Nagad:200, Rocket:200, Binance:5"
+  };
+  if (!row) return defaults;
+  try { return { ...defaults, ...JSON.parse(row.value) }; }
+  catch { return defaults; }
+}
+
+async function saveAdminSettings(db, incoming) {
+  const current = await getAdminSettings(db);
+  const settings = {
+    ...current,
+    currency: String(incoming.currency || current.currency),
+    adReward: Math.max(0, Number(incoming.adReward ?? current.adReward)),
+    dailyAdLimit: Math.max(1, Math.floor(Number(incoming.dailyAdLimit ?? current.dailyAdLimit))),
+    withdrawMethods: String(incoming.withdrawMethods ?? current.withdrawMethods)
+  };
+  await db.prepare("INSERT INTO app_settings(key,value) VALUES('config',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    .bind(JSON.stringify(settings)).run();
+  return settings;
+}
+
+async function requireAdmin(env, input) {
+  if (!env.DB || !env.BOT_TOKEN || !env.ADMIN_CHAT_ID) return null;
+  const initData = typeof input?.initData === "string" ? input.initData.trim() : "";
+  const telegramData = await validateTelegramInitData(initData, env.BOT_TOKEN);
+  if (!telegramData) return null;
+  if (String(telegramData.user.id) !== String(env.ADMIN_CHAT_ID)) return null;
+  return telegramData.user;
+}
+
+async function adminApi(request, env) {
+  if (request.method !== "POST") return json({ success:false, message:"Method not allowed." },405);
+  let input = {};
+  try { input = await request.json(); } catch { return json({success:false,message:"Invalid JSON."},400); }
+  const admin = await requireAdmin(env, input);
+  if (!admin) return json({ success:false, message:"Unauthorized admin access." },403);
+  const action = String(input.action || "data");
+  await ensureAdminTables(env.DB);
+
+  if (action === "data") {
+    const settings = await getAdminSettings(env.DB);
+    const users = await env.DB.prepare(`
+      SELECT u.id, u.telegram_id, u.username, u.first_name, u.last_name,
+             COALESCE(w.balance,0) AS balance,
+             COALESCE(w.lifetime_earned,0) AS lifetime_earned,
+             COALESCE(w.lifetime_withdrawn,0) AS lifetime_withdrawn
+      FROM users u LEFT JOIN wallets w ON w.user_id=u.id
+      ORDER BY u.id DESC LIMIT 500
+    `).all();
+    const withdrawals = await env.DB.prepare(`
+      SELECT wd.id, wd.user_id, wd.amount, wd.method, wd.address, wd.status, wd.created_at,
+             u.telegram_id, u.username, u.first_name, u.last_name
+      FROM withdrawals wd JOIN users u ON u.id=wd.user_id
+      ORDER BY wd.id DESC LIMIT 200
+    `).all();
+    return json({success:true,settings,users:users.results||[],withdrawals:withdrawals.results||[]});
+  }
+
+  if (action === "balance") {
+    const userId = Number(input.user_id);
+    const balance = Number(input.balance);
+    if (!Number.isInteger(userId) || !Number.isFinite(balance) || balance < 0) return json({success:false,message:"Invalid user or balance."},400);
+    const exists = await env.DB.prepare("SELECT id FROM users WHERE id=?").bind(userId).first();
+    if (!exists) return json({success:false,message:"User not found."},404);
+    const now = Math.floor(Date.now()/1000);
+    await env.DB.batch([
+      env.DB.prepare("INSERT OR IGNORE INTO wallets(user_id,balance,lifetime_earned,lifetime_withdrawn,updated_at) VALUES(?,0,0,0,?)").bind(userId,now),
+      env.DB.prepare("UPDATE wallets SET balance=?, updated_at=? WHERE user_id=?").bind(balance,now,userId)
+    ]);
+    return json({success:true});
+  }
+
+  if (action === "withdraw_status") {
+    const id = Number(input.withdrawal_id);
+    const status = String(input.status || "");
+    if (!Number.isInteger(id) || !["Completed","Cancelled"].includes(status)) return json({success:false,message:"Invalid withdrawal update."},400);
+    const wd = await env.DB.prepare("SELECT * FROM withdrawals WHERE id=?").bind(id).first();
+    if (!wd) return json({success:false,message:"Withdrawal not found."},404);
+    if (wd.status !== "Pending") return json({success:false,message:"Withdrawal already processed."},400);
+    const now = Math.floor(Date.now()/1000);
+    if (status === "Cancelled") {
+      await env.DB.batch([
+        env.DB.prepare("UPDATE withdrawals SET status=?, processed_at=? WHERE id=? AND status='Pending'").bind(status,now,id),
+        env.DB.prepare("UPDATE wallets SET balance=balance+?, updated_at=? WHERE user_id=?").bind(Number(wd.amount),now,Number(wd.user_id))
+      ]);
+    } else {
+      await env.DB.prepare("UPDATE withdrawals SET status=?, processed_at=? WHERE id=? AND status='Pending'").bind(status,now,id).run();
+      await env.DB.prepare("UPDATE wallets SET lifetime_withdrawn=lifetime_withdrawn+?, updated_at=? WHERE user_id=?").bind(Number(wd.amount),now,Number(wd.user_id)).run();
+    }
+    return json({success:true});
+  }
+
+  if (action === "settings") {
+    const settings = await saveAdminSettings(env.DB, input.settings || {});
+    return json({success:true,settings});
+  }
+
+  return json({success:false,message:"Unknown admin action."},404);
+}
+
+async function withdrawApi(request, env) {
+  if (request.method !== "POST") return json({success:false,message:"Method not allowed."},405);
+  if (!env.DB || !env.BOT_TOKEN) return json({success:false,message:"Server configuration is incomplete."},500);
+  let body;
+  try { body = await request.json(); } catch { return json({success:false,message:"Invalid JSON."},400); }
+  const initData = typeof body?.initData === "string" ? body.initData.trim() : "";
+  const telegramData = await validateTelegramInitData(initData, env.BOT_TOKEN);
+  if (!telegramData) return json({success:false,message:"Invalid Telegram authorization."},401);
+  const telegramId = String(telegramData.user.id);
+  const user = await env.DB.prepare("SELECT id FROM users WHERE telegram_id=? LIMIT 1").bind(telegramId).first();
+  if (!user) return json({success:false,message:"User not found."},404);
+  await ensureAdminTables(env.DB);
+  const settings = await getAdminSettings(env.DB);
+  const amount = Number(body.amount);
+  const method = String(body.method || "").trim();
+  const address = String(body.address || "").trim();
+  const parsed = String(settings.withdrawMethods).split(",").map(x=>{const [name,min]=x.split(":");return {name:String(name||"").trim(),min:Number(min||0)}});
+  const selected = parsed.find(x=>x.name===method);
+  if (!Number.isFinite(amount) || amount<=0 || !selected || !address) return json({success:false,message:"Invalid withdrawal request."},400);
+  if (amount < selected.min) return json({success:false,message:`Minimum withdrawal is ${selected.min}.`},400);
+  const now = Math.floor(Date.now()/1000);
+  const updated = await env.DB.prepare("UPDATE wallets SET balance=balance-?, updated_at=? WHERE user_id=? AND balance>=?").bind(amount,now,user.id,amount).run();
+  if (Number(updated?.meta?.changes||0)!==1) return json({success:false,message:"Insufficient balance."},400);
+  await env.DB.prepare("INSERT INTO withdrawals(user_id,amount,method,address,status,created_at) VALUES(?,?,?,?,?,?)").bind(user.id,amount,method,address,"Pending",now).run();
+  return json({success:true,message:"Withdrawal request submitted."});
+}
+
 function renderApp() {
   return APP_HTML;
 }
@@ -965,10 +1130,22 @@ button{font-family:inherit}
 .wall-head button{border:0;background:transparent;font-size:24px;padding:6px}
 .wall-title{font-weight:800;margin-left:4px}
 .wall-frame{width:100%;height:calc(100% - 54px);border:0;flex:1}
+.admin-fab{position:fixed;right:16px;bottom:82px;z-index:20;border:0;border-radius:16px;padding:10px 13px;background:#111827;color:#fff;font-weight:800;box-shadow:0 8px 20px rgba(0,0,0,.2)}
+.admin-overlay{position:fixed;inset:0;background:var(--tg-theme-bg-color,#f5f7fb);z-index:50;overflow:auto;padding:18px 16px 40px}
+.admin-box{max-width:560px;margin:0 auto}
+.admin-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.admin-head button{border:0;background:transparent;font-size:26px}
+.admin-section{background:var(--tg-theme-secondary-bg-color,#fff);border-radius:18px;padding:16px;margin-bottom:14px}
+.admin-row{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(127,127,127,.12)}
+.admin-row:last-child{border-bottom:0}
+.admin-input{width:100%;padding:10px;border:1px solid rgba(127,127,127,.2);border-radius:10px;background:transparent;color:inherit}
+.admin-btn{border:0;border-radius:10px;padding:9px 12px;font-weight:700}
+.admin-btn.ok{background:#16a34a;color:#fff}.admin-btn.no{background:#dc2626;color:#fff}.admin-btn.primary{background:#111827;color:#fff}
 </style>
 </head>
 <body>
 <div id="app"><div class="loading">Loading Coin Cove...</div></div>
+<button id="adminFab" class="admin-fab" style="display:none" onclick="openAdmin()">🛡️ Admin</button>
 
 <script>
 (function () {
@@ -987,6 +1164,7 @@ button{font-family:inherit}
   }
 
   let currentUser = null;
+  let IS_ADMIN = false;
 
   function getInitData() {
     if (tg && typeof tg.initData === "string" && tg.initData.trim()) {
@@ -1024,7 +1202,10 @@ button{font-family:inherit}
       }
 
       currentUser = data.user;
+      IS_ADMIN = data.isAdmin === true;
       render(data);
+      const adminFab = document.getElementById("adminFab");
+      if (adminFab) adminFab.style.display = IS_ADMIN ? "block" : "none";
     } catch (error) {
       console.error("loadApp error:", error);
       showError("Unable to connect to Coin Cove.");
@@ -1153,6 +1334,86 @@ button{font-family:inherit}
         '</div>' +
       '</div>';
   }
+
+  window.openAdmin = async function () {
+    if (!IS_ADMIN) return showAlert("Admin access denied.");
+    const old = document.getElementById("adminOverlay");
+    if (old) old.remove();
+    document.body.insertAdjacentHTML("beforeend", `
+      <div class="admin-overlay" id="adminOverlay">
+        <div class="admin-box">
+          <div class="admin-head"><strong>🛡️ Coin Cove Admin</strong><button onclick="closeAdmin()">×</button></div>
+          <div class="admin-section">
+            <h3 style="margin:0 0 12px">Settings</h3>
+            <input class="admin-input" id="admCurrency" placeholder="Currency name" style="margin-bottom:8px">
+            <input class="admin-input" id="admReward" type="number" min="0" placeholder="Ad reward" style="margin-bottom:8px">
+            <input class="admin-input" id="admLimit" type="number" min="1" placeholder="Daily ad limit" style="margin-bottom:8px">
+            <input class="admin-input" id="admMethods" placeholder="bKash:200, Nagad:200" style="margin-bottom:8px">
+            <button class="admin-btn primary" onclick="saveAdminSettings()">Save settings</button>
+          </div>
+          <div class="admin-section"><h3 style="margin:0 0 10px">Users</h3><div id="adminUsers">Loading...</div></div>
+          <div class="admin-section"><h3 style="margin:0 0 10px">Withdrawals</h3><div id="adminWithdrawals">Loading...</div></div>
+        </div>
+      </div>`);
+    await refreshAdmin();
+  };
+
+  window.closeAdmin = function () {
+    const el = document.getElementById("adminOverlay");
+    if (el) el.remove();
+  };
+
+  async function adminRequest(action, extra) {
+    const initData = getInitData();
+    const response = await fetch("/api/admin", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(Object.assign({action, initData}, extra || {})),
+      cache: "no-store"
+    });
+    return await response.json();
+  }
+
+  async function refreshAdmin() {
+    const data = await adminRequest("data");
+    if (!data.success) { showAlert(data.message || "Admin error"); return; }
+    document.getElementById("admCurrency").value = data.settings.currency || "Coins";
+    document.getElementById("admReward").value = data.settings.adReward ?? 10;
+    document.getElementById("admLimit").value = data.settings.dailyAdLimit ?? 10;
+    document.getElementById("admMethods").value = data.settings.withdrawMethods || "";
+    document.getElementById("adminUsers").innerHTML = data.users.length ? data.users.map(u =>
+      `<div class="admin-row"><div><b>${escapeHtml(u.first_name || "User")}</b><div style="font-size:11px;opacity:.55">TG: ${escapeHtml(u.telegram_id)}</div></div><div style="text-align:right"><div>${Number(u.balance||0)} Coins</div><button class="admin-btn primary" onclick="editAdminBalance(${Number(u.id)},${Number(u.balance||0)})">Edit</button></div></div>`).join("") : "No users";
+    document.getElementById("adminWithdrawals").innerHTML = data.withdrawals.length ? data.withdrawals.map(w =>
+      `<div class="admin-row"><div><b>${escapeHtml(w.first_name || "User")}</b><div style="font-size:11px;opacity:.55">${escapeHtml(w.method)} · ${escapeHtml(w.address)}</div></div><div style="text-align:right"><div>${Number(w.amount||0)} Coins</div><div style="font-size:11px;margin:3px 0">${escapeHtml(w.status)}</div>${w.status === "Pending" ? `<button class="admin-btn ok" onclick="setWithdraw(${Number(w.id)},'Completed')">✓</button> <button class="admin-btn no" onclick="setWithdraw(${Number(w.id)},'Cancelled')">×</button>` : ""}</div></div>`).join("") : "No withdrawals";
+  }
+
+  window.editAdminBalance = async function (userId, current) {
+    const value = prompt("New balance:", String(current));
+    if (value === null) return;
+    const balance = Number(value);
+    if (!Number.isFinite(balance) || balance < 0) return showAlert("Invalid balance.");
+    const d = await adminRequest("balance", {user_id:userId,balance});
+    showAlert(d.success ? "Balance updated." : (d.message || "Update failed."));
+    if (d.success) { await refreshAdmin(); await loadApp(); }
+  };
+
+  window.setWithdraw = async function (withdrawalId, status) {
+    if (!confirm("Change withdrawal status to " + status + "?")) return;
+    const d = await adminRequest("withdraw_status", {withdrawal_id:withdrawalId,status});
+    showAlert(d.success ? "Withdrawal updated." : (d.message || "Update failed."));
+    if (d.success) { await refreshAdmin(); await loadApp(); }
+  };
+
+  window.saveAdminSettings = async function () {
+    const settings = {
+      currency: document.getElementById("admCurrency").value.trim() || "Coins",
+      adReward: Number(document.getElementById("admReward").value),
+      dailyAdLimit: Number(document.getElementById("admLimit").value),
+      withdrawMethods: document.getElementById("admMethods").value.trim()
+    };
+    const d = await adminRequest("settings", {settings});
+    showAlert(d.success ? "Settings saved." : (d.message || "Save failed."));
+  };
 
   window.openOffers = function () {
     if (!currentUser || !currentUser.telegram_id) {
