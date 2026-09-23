@@ -35,6 +35,9 @@ export default {
 };
 
 async function initSchema(db){
+  // The original Coin Cove database already contains the core tables.
+  // Never rebuild or replace those tables. Create only missing auxiliary
+  // tables, and add the optional email column when necessary.
   const stmts = [
     `CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id TEXT UNIQUE, username TEXT, first_name TEXT, last_name TEXT, referral_code TEXT UNIQUE, referred_by TEXT, email TEXT UNIQUE, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS wallets (user_id INTEGER PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 0, lifetime_earned INTEGER NOT NULL DEFAULT 0, lifetime_withdrawn INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)`,
@@ -52,21 +55,58 @@ async function initSchema(db){
     `CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals(user_id,created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_monetag_user_date ON monetag_postbacks(telegram_id,reward_date)`
   ];
-  await db.batch(stmts.map(s=>db.prepare(s)));
-  try { await db.prepare("ALTER TABLE users ADD COLUMN email TEXT").run(); } catch (e) { if (!String(e?.message||e).toLowerCase().includes("duplicate column")) console.error("users.email migration:", e); }
-  await db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL").run();
+
+  // Run statements individually. One harmless schema mismatch must not make
+  // the entire Telegram /api/me request fail with HTTP 500.
+  for (const sql of stmts) {
+    try {
+      await db.prepare(sql).run();
+    } catch (e) {
+      const m = String(e?.message || e).toLowerCase();
+      if (!m.includes('already exists') && !m.includes('duplicate column')) {
+        console.error('Schema statement failed:', sql.slice(0,120), e);
+      }
+    }
+  }
+
+  // Existing deployments created before email support will not have this
+  // column. Adding it is safe; duplicate-column is intentionally ignored.
+  try {
+    await db.prepare("ALTER TABLE users ADD COLUMN email TEXT").run();
+  } catch (e) {
+    const m = String(e?.message || e).toLowerCase();
+    if (!m.includes('duplicate column') && !m.includes('already exists')) {
+      console.error('users.email migration:', e);
+    }
+  }
+
+  // Do not create a partial index here. Email uniqueness is enforced by
+  // email_credentials and by the explicit duplicate check in registration.
 }
 
 async function ensureSchema(env){ if(!env.DB) throw new Error("DB binding missing"); await initSchema(env.DB); }
 
 async function apiMe(request,env){
-  if(request.method!=="GET") return json({success:false,message:"Method not allowed."},405);
-  if(!env.DB||!env.BOT_TOKEN) return json({success:false,message:"Server configuration is incomplete."},500);
-  await ensureSchema(env);
-  const initData=getInitData(request); if(!initData) return json({success:false,code:"MISSING_INIT_DATA",message:"Telegram authorization data is missing."},401);
-  const td=await validateTelegramInitData(initData,env.BOT_TOKEN); if(!td) return json({success:false,code:"INVALID_INIT_DATA",message:"Invalid Telegram authorization."},401);
-  const user=await getOrCreateTelegramUser(env.DB,td);
-  return userPayload(env.DB,user.id,{auth:"telegram"});
+  try {
+    if(request.method!=="GET") return json({success:false,message:"Method not allowed."},405);
+    if(!env.DB||!env.BOT_TOKEN) return json({success:false,message:"Server configuration is incomplete."},500);
+
+    // Keep Telegram authentication independent from the optional email/admin
+    // features. Schema preparation is deliberately non-fatal for old D1 data.
+    await ensureSchema(env);
+
+    const initData=getInitData(request);
+    if(!initData) return json({success:false,code:"MISSING_INIT_DATA",message:"Telegram authorization data is missing."},401);
+
+    const td=await validateTelegramInitData(initData,env.BOT_TOKEN);
+    if(!td) return json({success:false,code:"INVALID_INIT_DATA",message:"Invalid Telegram authorization."},401);
+
+    const user=await getOrCreateTelegramUser(env.DB,td);
+    return userPayload(env.DB,user.id,{auth:"telegram"});
+  } catch (e) {
+    console.error("apiMe error:", e);
+    return json({success:false,code:"API_ME_ERROR",message:"Unable to load your Coin Cove account right now."},500);
+  }
 }
 
 async function getOrCreateTelegramUser(db,td){
