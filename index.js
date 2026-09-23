@@ -372,22 +372,38 @@ async function validateTelegramInitData(initData, botToken) {
 
   try {
     const params = new URLSearchParams(initData);
-    const receivedHash = params.get("hash");
 
-    if (!receivedHash) return null;
+    const receivedHash = params.get("hash");
+    if (!receivedHash) {
+      console.error("Telegram validation: hash is missing");
+      return null;
+    }
 
     params.delete("hash");
 
-    const entries = Array.from(params.entries()).sort((a, b) =>
-      a[0].localeCompare(b[0])
-    );
+    const entries = [...params.entries()];
+
+    entries.sort((a, b) => {
+      if (a[0] < b[0]) return -1;
+      if (a[0] > b[0]) return 1;
+      return 0;
+    });
 
     const dataCheckString = entries
       .map(([key, value]) => `${key}=${value}`)
       .join("\n");
 
+    /*
+     * Telegram Mini App validation:
+     *
+     * secret_key = HMAC-SHA256(
+     *   key = bot token,
+     *   data = "WebAppData"
+     * )
+     */
+
     const secretKey = await hmacSha256(
-      new TextEncoder().encode(botToken),
+      new TextEncoder().encode(String(botToken)),
       "WebAppData"
     );
 
@@ -396,44 +412,70 @@ async function validateTelegramInitData(initData, botToken) {
       dataCheckString
     );
 
-    if (!constantTimeEqual(calculatedHash, receivedHash)) {
+    if (!constantTimeEqual(
+      calculatedHash.toLowerCase(),
+      receivedHash.toLowerCase()
+    )) {
       console.error("Telegram hash mismatch");
       return null;
     }
 
-    const authDate = Number(params.get("auth_date"));
+    const authDateRaw = params.get("auth_date");
+    const authDate = Number(authDateRaw);
     const now = Math.floor(Date.now() / 1000);
 
     if (!Number.isFinite(authDate) || authDate <= 0) {
+      console.error("Telegram validation: invalid auth_date");
       return null;
     }
 
+    /*
+     * Reject timestamps from the future.
+     */
     if (authDate > now + 300) {
+      console.error("Telegram validation: auth_date is in the future");
       return null;
     }
 
+    /*
+     * Telegram initData should not be reused indefinitely.
+     */
     if (now - authDate > 86400) {
+      console.error("Telegram validation: initData expired");
       return null;
     }
 
     const userRaw = params.get("user");
 
-    if (!userRaw) return null;
+    if (!userRaw) {
+      console.error("Telegram validation: user is missing");
+      return null;
+    }
 
-    const user = JSON.parse(userRaw);
+    let user;
 
-    if (!user || !user.id) return null;
+    try {
+      user = JSON.parse(userRaw);
+    } catch (error) {
+      console.error("Telegram validation: invalid user JSON");
+      return null;
+    }
+
+    if (!user || !user.id) {
+      console.error("Telegram validation: user.id is missing");
+      return null;
+    }
 
     return {
       user,
       start_param: params.get("start_param") || null
     };
+
   } catch (error) {
     console.error("Telegram validation error:", error);
     return null;
   }
 }
-
 async function hmacSha256(keyBytes, message) {
   const key = await crypto.subtle.importKey(
     "raw",
