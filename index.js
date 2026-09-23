@@ -71,15 +71,18 @@ async function apiMe(request, env) {
     }, 401);
   }
 
-  const telegramData = await validateTelegramInitData(initData, env.BOT_TOKEN);
+  const telegramData = await validateTelegramInitData(
+  initData,
+  env.BOT_TOKEN
+);
 
-  if (!telegramData) {
-    return json({
-      success: false,
-      code: "INVALID_INIT_DATA",
-      message: "Invalid Telegram authorization."
-    }, 401);
-  }
+if (!telegramData) {
+  return json({
+    success: false,
+    code: "INVALID_INIT_DATA",
+    message: "Telegram validation failed. Check Worker logs."
+  }, 401);
+}
 
   const user = telegramData.user;
   const now = Math.floor(Date.now() / 1000);
