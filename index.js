@@ -241,8 +241,8 @@ async function emailRegister(request,env){
   const syntheticTelegramId = "email:" + crypto.randomUUID();
   let user;
   try {
-    await env.DB.prepare("INSERT INTO users(telegram_id,username,first_name,last_name,email,referral_code,referred_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
-      .bind(syntheticTelegramId,null,"Email User",null,email,generateReferralCode(),null,now,now).run();
+    await env.DB.prepare("INSERT INTO users(telegram_id,email,first_name,referral_code,created_at,updated_at) VALUES(?,?,?,?,?,?)")
+      .bind(syntheticTelegramId,email,"",generateReferralCode(),now,now).run();
     user=await env.DB.prepare("SELECT * FROM users WHERE email=? LIMIT 1").bind(email).first();
     if(!user) throw new Error("Email account was not created.");
     await env.DB.batch([
@@ -253,7 +253,7 @@ async function emailRegister(request,env){
     console.error("Email registration error:",e);
     const msg=String(e?.message||e).toLowerCase();
     if(msg.includes("unique")||msg.includes("constraint")) return json({success:false,message:"This email is already registered."},409);
-    return json({success:false,message:"Unable to create the account: " + String(e?.message || "database error")},500);
+    return json({success:false,message:"Unable to create the account. Please try again."},500);
   }
   const token=await createSession(env.DB,user.id); return userPayload(env.DB,user.id,{auth:"email",sessionCreated:true,token});
 }
@@ -302,8 +302,10 @@ async function hmacSha256(keyBytes,message){const key=await crypto.subtle.import
 async function hmacSha256Hex(keyBytes,message){const s=await hmacSha256(keyBytes,message);return Array.from(new Uint8Array(s)).map(b=>b.toString(16).padStart(2,"0")).join("");}
 async function hmacHexText(secret,message){return hmacSha256Hex(new TextEncoder().encode(secret),message);}
 async function sha256Hex(message){const d=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(message));return Array.from(new Uint8Array(d)).map(b=>b.toString(16).padStart(2,"0")).join("");}
-async function hashPassword(password){const salt=randomBytes(16);const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:120000,hash:"SHA-256"},key,256);return {hash:bytesToHex(new Uint8Array(bits)),salt:bytesToHex(salt)};}
-async function verifyPassword(password,hash,saltHex){const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);const salt=hexToBytes(saltHex),bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:120000,hash:"SHA-256"},key,256);return constantTimeEqual(bytesToHex(new Uint8Array(bits)),hash);}
+// Cloudflare Workers WebCrypto currently rejects PBKDF2 iteration counts above 100000.
+// Keep registration and login on the same supported work factor.
+async function hashPassword(password){const salt=randomBytes(16);const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:100000,hash:"SHA-256"},key,256);return {hash:bytesToHex(new Uint8Array(bits)),salt:bytesToHex(salt)};}
+async function verifyPassword(password,hash,saltHex){const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);const salt=hexToBytes(saltHex),bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:100000,hash:"SHA-256"},key,256);return constantTimeEqual(bytesToHex(new Uint8Array(bits)),hash);}
 function randomBytes(n){const a=new Uint8Array(n);crypto.getRandomValues(a);return a;}function bytesToHex(a){return Array.from(a).map(b=>b.toString(16).padStart(2,"0")).join("");}function hexToBytes(h){const a=new Uint8Array(h.length/2);for(let i=0;i<a.length;i++)a[i]=parseInt(h.slice(i*2,i*2+2),16);return a;}function randomToken(){return bytesToHex(randomBytes(32));}
 function constantTimeEqual(a,b){if(typeof a!=="string"||typeof b!=="string"||a.length!==b.length)return false;let r=0;for(let i=0;i<a.length;i++)r|=a.charCodeAt(i)^b.charCodeAt(i);return r===0;}
 function generateReferralCode(){return crypto.randomUUID().replace(/-/g,"").slice(0,12).toUpperCase();}function normalizeEmail(v){return String(v||"").trim().toLowerCase();}function validEmail(e){return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);}
