@@ -241,8 +241,8 @@ async function emailRegister(request,env){
   const syntheticTelegramId = "email:" + crypto.randomUUID();
   let user;
   try {
-    await env.DB.prepare("INSERT INTO users(telegram_id,email,first_name,referral_code,created_at,updated_at) VALUES(?,?,?,?,?,?)")
-      .bind(syntheticTelegramId,email,"",generateReferralCode(),now,now).run();
+    await env.DB.prepare("INSERT INTO users(telegram_id,username,first_name,last_name,email,referral_code,referred_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+      .bind(syntheticTelegramId,null,"Email User",null,email,generateReferralCode(),null,now,now).run();
     user=await env.DB.prepare("SELECT * FROM users WHERE email=? LIMIT 1").bind(email).first();
     if(!user) throw new Error("Email account was not created.");
     await env.DB.batch([
@@ -253,7 +253,7 @@ async function emailRegister(request,env){
     console.error("Email registration error:",e);
     const msg=String(e?.message||e).toLowerCase();
     if(msg.includes("unique")||msg.includes("constraint")) return json({success:false,message:"This email is already registered."},409);
-    return json({success:false,message:"Unable to create the account. Please try again."},500);
+    return json({success:false,message:"Unable to create the account: " + String(e?.message || "database error")},500);
   }
   const token=await createSession(env.DB,user.id); return userPayload(env.DB,user.id,{auth:"email",sessionCreated:true,token});
 }
