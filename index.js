@@ -974,63 +974,147 @@ async function requireAdmin(env, input) {
 
 async function adminApi(request, env) {
   if (request.method !== "POST") return json({ success:false, message:"Method not allowed." },405);
+
   let input = {};
-  try { input = await request.json(); } catch { return json({success:false,message:"Invalid JSON."},400); }
+  try { input = await request.json(); }
+  catch { return json({ success:false, message:"Invalid JSON." },400); }
+
   const admin = await requireAdmin(env, input);
   if (!admin) return json({ success:false, message:"Unauthorized admin access." },403);
+  if (!env.DB) return json({ success:false, message:"Database binding DB is missing." },500);
+
   const action = String(input.action || "data");
   await ensureAdminTables(env.DB);
 
   if (action === "data") {
     const settings = await getAdminSettings(env.DB);
+
     const users = await env.DB.prepare(`
       SELECT u.id, u.telegram_id, u.username, u.first_name, u.last_name,
              COALESCE(w.balance,0) AS balance,
              COALESCE(w.lifetime_earned,0) AS lifetime_earned,
              COALESCE(w.lifetime_withdrawn,0) AS lifetime_withdrawn
-      FROM users u LEFT JOIN wallets w ON w.user_id=u.id
+      FROM users u
+      LEFT JOIN wallets w ON w.user_id=u.id
       ORDER BY u.id DESC LIMIT 500
     `).all();
+
     const withdrawals = await env.DB.prepare(`
-      SELECT wd.id, wd.user_id, wd.amount, wd.method, wd.address, wd.status, wd.created_at,
+      SELECT wd.id, wd.user_id, wd.amount, wd.method, wd.address, wd.status,
+             wd.created_at, wd.processed_at,
              u.telegram_id, u.username, u.first_name, u.last_name
-      FROM withdrawals wd JOIN users u ON u.id=wd.user_id
+      FROM withdrawals wd
+      JOIN users u ON u.id=wd.user_id
       ORDER BY wd.id DESC LIMIT 200
     `).all();
-    return json({success:true,settings,users:users.results||[],withdrawals:withdrawals.results||[]});
+
+    const stats = await env.DB.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM users) AS users_count,
+        (SELECT COALESCE(SUM(balance),0) FROM wallets) AS total_balance,
+        (SELECT COALESCE(SUM(lifetime_earned),0) FROM wallets) AS total_earned,
+        (SELECT COALESCE(SUM(lifetime_withdrawn),0) FROM wallets) AS total_withdrawn,
+        (SELECT COUNT(*) FROM withdrawals WHERE status='Pending') AS pending_withdrawals,
+        (SELECT COUNT(*) FROM withdrawals) AS withdrawals_count
+    `).first();
+
+    const transactions = await env.DB.prepare(`
+      SELECT t.id, t.user_id, t.type, t.amount, t.description, t.created_at,
+             u.telegram_id, u.username, u.first_name
+      FROM transactions t
+      LEFT JOIN users u ON u.id=t.user_id
+      ORDER BY t.id DESC LIMIT 300
+    `).all();
+
+    return json({
+      success:true,
+      settings,
+      stats: stats || {},
+      users: users.results || [],
+      withdrawals: withdrawals.results || [],
+      transactions: transactions.results || []
+    });
   }
 
   if (action === "balance") {
     const userId = Number(input.user_id);
-    const balance = Number(input.balance);
-    if (!Number.isInteger(userId) || !Number.isFinite(balance) || balance < 0) return json({success:false,message:"Invalid user or balance."},400);
+    const mode = String(input.mode || "set");
+    const value = Number(input.value);
+
+    if (!Number.isInteger(userId) || !Number.isFinite(value) || value < 0) {
+      return json({success:false,message:"Invalid user or amount."},400);
+    }
+
     const exists = await env.DB.prepare("SELECT id FROM users WHERE id=?").bind(userId).first();
     if (!exists) return json({success:false,message:"User not found."},404);
+
     const now = Math.floor(Date.now()/1000);
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO wallets(user_id,balance,lifetime_earned,lifetime_withdrawn,updated_at) VALUES(?,0,0,0,?)"
+    ).bind(userId,now).run();
+
+    const wallet = await env.DB.prepare("SELECT balance FROM wallets WHERE user_id=?").bind(userId).first();
+    const oldBalance = Number(wallet?.balance || 0);
+    let newBalance;
+    let transactionAmount;
+    let description;
+
+    if (mode === "add") {
+      newBalance = oldBalance + value;
+      transactionAmount = value;
+      description = "Admin added Coins";
+    } else if (mode === "subtract") {
+      if (value > oldBalance) return json({success:false,message:"Cannot subtract more than the current balance."},400);
+      newBalance = oldBalance - value;
+      transactionAmount = -value;
+      description = "Admin removed Coins";
+    } else if (mode === "set") {
+      newBalance = value;
+      transactionAmount = value - oldBalance;
+      description = "Admin set balance";
+    } else {
+      return json({success:false,message:"Invalid balance mode."},400);
+    }
+
     await env.DB.batch([
-      env.DB.prepare("INSERT OR IGNORE INTO wallets(user_id,balance,lifetime_earned,lifetime_withdrawn,updated_at) VALUES(?,0,0,0,?)").bind(userId,now),
-      env.DB.prepare("UPDATE wallets SET balance=?, updated_at=? WHERE user_id=?").bind(balance,now,userId)
+      env.DB.prepare("UPDATE wallets SET balance=?, updated_at=? WHERE user_id=?").bind(newBalance,now,userId),
+      env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
+        .bind(userId,"admin_balance",transactionAmount,description,now)
     ]);
-    return json({success:true});
+
+    return json({success:true,balance:newBalance});
   }
 
   if (action === "withdraw_status") {
     const id = Number(input.withdrawal_id);
     const status = String(input.status || "");
-    if (!Number.isInteger(id) || !["Completed","Cancelled"].includes(status)) return json({success:false,message:"Invalid withdrawal update."},400);
+    if (!Number.isInteger(id) || !["Completed","Cancelled"].includes(status)) {
+      return json({success:false,message:"Invalid withdrawal update."},400);
+    }
+
     const wd = await env.DB.prepare("SELECT * FROM withdrawals WHERE id=?").bind(id).first();
     if (!wd) return json({success:false,message:"Withdrawal not found."},404);
     if (wd.status !== "Pending") return json({success:false,message:"Withdrawal already processed."},400);
+
     const now = Math.floor(Date.now()/1000);
+    const amount = Number(wd.amount || 0);
+
     if (status === "Cancelled") {
       await env.DB.batch([
         env.DB.prepare("UPDATE withdrawals SET status=?, processed_at=? WHERE id=? AND status='Pending'").bind(status,now,id),
-        env.DB.prepare("UPDATE wallets SET balance=balance+?, updated_at=? WHERE user_id=?").bind(Number(wd.amount),now,Number(wd.user_id))
+        env.DB.prepare("UPDATE wallets SET balance=balance+?, updated_at=? WHERE user_id=?").bind(amount,now,Number(wd.user_id)),
+        env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
+          .bind(Number(wd.user_id),"withdrawal_refund",amount,"Withdrawal cancelled - Coins returned",now)
       ]);
     } else {
-      await env.DB.prepare("UPDATE withdrawals SET status=?, processed_at=? WHERE id=? AND status='Pending'").bind(status,now,id).run();
-      await env.DB.prepare("UPDATE wallets SET lifetime_withdrawn=lifetime_withdrawn+?, updated_at=? WHERE user_id=?").bind(Number(wd.amount),now,Number(wd.user_id)).run();
+      await env.DB.batch([
+        env.DB.prepare("UPDATE withdrawals SET status=?, processed_at=? WHERE id=? AND status='Pending'").bind(status,now,id),
+        env.DB.prepare("UPDATE wallets SET lifetime_withdrawn=lifetime_withdrawn+?, updated_at=? WHERE user_id=?").bind(amount,now,Number(wd.user_id)),
+        env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
+          .bind(Number(wd.user_id),"withdrawal_completed",-amount,"Withdrawal completed",now)
+      ]);
     }
+
     return json({success:true});
   }
 
@@ -1131,16 +1215,28 @@ button{font-family:inherit}
 .wall-title{font-weight:800;margin-left:4px}
 .wall-frame{width:100%;height:calc(100% - 54px);border:0;flex:1}
 .admin-fab{position:fixed;right:16px;bottom:82px;z-index:20;border:0;border-radius:16px;padding:10px 13px;background:#111827;color:#fff;font-weight:800;box-shadow:0 8px 20px rgba(0,0,0,.2)}
-.admin-overlay{position:fixed;inset:0;background:var(--tg-theme-bg-color,#f5f7fb);z-index:50;overflow:auto;padding:18px 16px 40px}
-.admin-box{max-width:560px;margin:0 auto}
-.admin-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-.admin-head button{border:0;background:transparent;font-size:26px}
+.admin-overlay{position:fixed;inset:0;background:var(--tg-theme-bg-color,#f5f7fb);z-index:50;overflow:auto;padding:calc(18px + env(safe-area-inset-top)) 16px calc(40px + env(safe-area-inset-bottom))}
+.admin-box{max-width:720px;margin:0 auto}
+.admin-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;position:sticky;top:0;background:var(--tg-theme-bg-color,#f5f7fb);padding:6px 0 12px;z-index:2}
+.admin-head strong{font-size:20px}
+.admin-head button{border:0;background:rgba(127,127,127,.12);width:40px;height:40px;border-radius:12px;font-size:26px;color:inherit}
 .admin-section{background:var(--tg-theme-secondary-bg-color,#fff);border-radius:18px;padding:16px;margin-bottom:14px}
-.admin-row{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(127,127,127,.12)}
+.admin-section h3{font-size:17px}
+.admin-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.admin-stat{background:rgba(127,127,127,.08);border-radius:14px;padding:13px}
+.admin-stat-number{font-size:20px;font-weight:850}
+.admin-stat-label{font-size:11px;opacity:.55;margin-top:3px}
+.admin-row{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid rgba(127,127,127,.12)}
 .admin-row:last-child{border-bottom:0}
-.admin-input{width:100%;padding:10px;border:1px solid rgba(127,127,127,.2);border-radius:10px;background:transparent;color:inherit}
-.admin-btn{border:0;border-radius:10px;padding:9px 12px;font-weight:700}
-.admin-btn.ok{background:#16a34a;color:#fff}.admin-btn.no{background:#dc2626;color:#fff}.admin-btn.primary{background:#111827;color:#fff}
+.admin-user-main{min-width:0;flex:1}.admin-user-name{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.admin-muted{font-size:11px;opacity:.55;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.admin-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.admin-input{width:100%;padding:11px 12px;border:1px solid rgba(127,127,127,.2);border-radius:11px;background:transparent;color:inherit;font-size:14px}
+.admin-btn{border:0;border-radius:10px;padding:9px 12px;font-weight:750;cursor:pointer}
+.admin-btn.ok{background:#16a34a;color:#fff}.admin-btn.no{background:#dc2626;color:#fff}.admin-btn.primary{background:#111827;color:#fff}.admin-btn.secondary{background:rgba(127,127,127,.12);color:inherit}
+.admin-search{margin:10px 0}.admin-pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:800;background:rgba(127,127,127,.12)}
+.admin-table-note{font-size:11px;opacity:.55;margin-top:8px}.admin-empty{text-align:center;padding:18px;opacity:.55}
+.admin-tx{display:flex;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px solid rgba(127,127,127,.12)}
+@media(min-width:650px){.admin-grid{grid-template-columns:repeat(3,1fr)}}
 </style>
 </head>
 <body>
@@ -1339,22 +1435,26 @@ button{font-family:inherit}
     if (!IS_ADMIN) return showAlert("Admin access denied.");
     const old = document.getElementById("adminOverlay");
     if (old) old.remove();
+
     document.body.insertAdjacentHTML("beforeend",
       '<div class="admin-overlay" id="adminOverlay">' +
         '<div class="admin-box">' +
           '<div class="admin-head"><strong>🛡️ Coin Cove Admin</strong><button onclick="closeAdmin()">×</button></div>' +
+          '<div class="admin-section"><h3 style="margin:0 0 12px">📊 Dashboard</h3><div class="admin-grid" id="adminStats"><div class="admin-stat"><div class="admin-stat-number">…</div><div class="admin-stat-label">Users</div></div></div></div>' +
           '<div class="admin-section">' +
-            '<h3 style="margin:0 0 12px">Settings</h3>' +
+            '<h3 style="margin:0 0 12px">⚙️ Settings</h3>' +
             '<input class="admin-input" id="admCurrency" placeholder="Currency name" style="margin-bottom:8px">' +
             '<input class="admin-input" id="admReward" type="number" min="0" placeholder="Ad reward" style="margin-bottom:8px">' +
             '<input class="admin-input" id="admLimit" type="number" min="1" placeholder="Daily ad limit" style="margin-bottom:8px">' +
             '<input class="admin-input" id="admMethods" placeholder="bKash:200, Nagad:200" style="margin-bottom:8px">' +
             '<button class="admin-btn primary" onclick="saveAdminSettings()">Save settings</button>' +
           '</div>' +
-          '<div class="admin-section"><h3 style="margin:0 0 10px">Users</h3><div id="adminUsers">Loading...</div></div>' +
-          '<div class="admin-section"><h3 style="margin:0 0 10px">Withdrawals</h3><div id="adminWithdrawals">Loading...</div></div>' +
+          '<div class="admin-section"><h3 style="margin:0 0 8px">👥 Users</h3><input class="admin-input admin-search" id="adminUserSearch" placeholder="Search name, username or Telegram ID" oninput="filterAdminUsers()"><div id="adminUsers">Loading...</div></div>' +
+          '<div class="admin-section"><h3 style="margin:0 0 8px">💸 Withdrawals</h3><div id="adminWithdrawals">Loading...</div></div>' +
+          '<div class="admin-section"><h3 style="margin:0 0 8px">📜 Transactions</h3><div id="adminTransactions">Loading...</div></div>' +
         '</div>' +
       '</div>');
+
     await refreshAdmin();
   };
 
@@ -1363,48 +1463,129 @@ button{font-family:inherit}
     if (el) el.remove();
   };
 
+  let ADMIN_CACHE = {users:[], withdrawals:[], transactions:[], stats:{}, settings:{}};
+
   async function adminRequest(action, extra) {
     const initData = getInitData();
     const response = await fetch("/api/admin", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify(Object.assign({action, initData}, extra || {})),
+      body: JSON.stringify(Object.assign({action:action, initData:initData}, extra || {})),
       cache: "no-store"
     });
-    return await response.json();
+    let data;
+    try { data = await response.json(); }
+    catch { return {success:false,message:"Invalid server response."}; }
+    if (!response.ok && !data.message) data.message = "Admin request failed.";
+    return data;
+  }
+
+  function adminStat(label, value) {
+    return '<div class="admin-stat"><div class="admin-stat-number">' + escapeHtml(String(value)) + '</div><div class="admin-stat-label">' + escapeHtml(label) + '</div></div>';
+  }
+
+  function renderAdminUsers(users) {
+    const el = document.getElementById("adminUsers");
+    if (!el) return;
+    if (!users.length) { el.innerHTML = '<div class="admin-empty">No users found</div>'; return; }
+
+    el.innerHTML = users.map(function(u) {
+      const name = [u.first_name || "", u.last_name || ""].join(" ").trim() || "User";
+      const username = u.username ? "@" + u.username : "No username";
+      return '<div class="admin-row">' +
+        '<div class="admin-user-main"><div class="admin-user-name">' + escapeHtml(name) + '</div><div class="admin-muted">' + escapeHtml(username) + ' · TG: ' + escapeHtml(u.telegram_id) + '</div><div class="admin-muted">Earned: ' + Number(u.lifetime_earned || 0) + ' · Withdrawn: ' + Number(u.lifetime_withdrawn || 0) + '</div></div>' +
+        '<div style="text-align:right"><div style="font-weight:850;margin-bottom:6px">' + Number(u.balance || 0) + ' Coins</div><div class="admin-actions"><button class="admin-btn primary" onclick="editAdminBalance(' + Number(u.id) + ',' + Number(u.balance || 0) + ')">Set</button><button class="admin-btn secondary" onclick="adjustAdminBalance(' + Number(u.id) + ',\'add\')">+ Add</button><button class="admin-btn secondary" onclick="adjustAdminBalance(' + Number(u.id) + ',\'subtract\')">− Remove</button></div></div>' +
+      '</div>';
+    }).join("");
+  }
+
+  window.filterAdminUsers = function () {
+    const q = String(document.getElementById("adminUserSearch")?.value || "").trim().toLowerCase();
+    const filtered = ADMIN_CACHE.users.filter(function(u) {
+      return [u.first_name,u.last_name,u.username,u.telegram_id].join(" ").toLowerCase().includes(q);
+    });
+    renderAdminUsers(filtered);
+  };
+
+  function renderAdminWithdrawals(rows) {
+    const el = document.getElementById("adminWithdrawals");
+    if (!el) return;
+    if (!rows.length) { el.innerHTML = '<div class="admin-empty">No withdrawal requests</div>'; return; }
+
+    el.innerHTML = rows.map(function(w) {
+      const name = [w.first_name || "", w.last_name || ""].join(" ").trim() || "User";
+      const buttons = w.status === "Pending" ?
+        '<div class="admin-actions"><button class="admin-btn ok" onclick="setWithdraw(' + Number(w.id) + ',\'Completed\')">✓ Approve</button><button class="admin-btn no" onclick="setWithdraw(' + Number(w.id) + ',\'Cancelled\')">× Reject</button></div>' :
+        '<span class="admin-pill">' + escapeHtml(w.status) + '</span>';
+      return '<div class="admin-row"><div class="admin-user-main"><div class="admin-user-name">#' + Number(w.id) + ' · ' + escapeHtml(name) + '</div><div class="admin-muted">' + escapeHtml(w.method) + ' · ' + escapeHtml(w.address) + '</div><div class="admin-muted">' + formatDate(w.created_at) + ' · Telegram: ' + escapeHtml(w.telegram_id) + '</div></div><div style="text-align:right"><div style="font-weight:850;margin-bottom:6px">' + Number(w.amount || 0) + ' Coins</div>' + buttons + '</div></div>';
+    }).join("");
+  }
+
+  function renderAdminTransactions(rows) {
+    const el = document.getElementById("adminTransactions");
+    if (!el) return;
+    if (!rows.length) { el.innerHTML = '<div class="admin-empty">No transactions</div>'; return; }
+    el.innerHTML = rows.slice(0,100).map(function(t) {
+      const name = [t.first_name || "", t.username ? "@" + t.username : ""].join(" ").trim() || "User";
+      const amount = Number(t.amount || 0);
+      return '<div class="admin-tx"><div><div style="font-weight:700;font-size:12px">' + escapeHtml(t.description || t.type || "Transaction") + '</div><div class="admin-muted">' + escapeHtml(name) + ' · ' + formatDate(t.created_at) + '</div></div><div style="font-weight:850">' + (amount > 0 ? "+" : "") + amount + '</div></div>';
+    }).join("");
   }
 
   async function refreshAdmin() {
     const data = await adminRequest("data");
     if (!data.success) { showAlert(data.message || "Admin error"); return; }
-    document.getElementById("admCurrency").value = data.settings.currency || "Coins";
-    document.getElementById("admReward").value = data.settings.adReward ?? 10;
-    document.getElementById("admLimit").value = data.settings.dailyAdLimit ?? 10;
-    document.getElementById("admMethods").value = data.settings.withdrawMethods || "";
-    document.getElementById("adminUsers").innerHTML = data.users.length ? data.users.map(u =>
-      "<div class=\"admin-row\"><div><b>" + escapeHtml(u.first_name || "User") + "</b><div style=\"font-size:11px;opacity:.55\">TG: " + escapeHtml(u.telegram_id) + "</div></div><div style=\"text-align:right\"><div>" + Number(u.balance || 0) + " Coins</div><button class=\"admin-btn primary\" onclick=\"editAdminBalance(" + Number(u.id) + "," + Number(u.balance || 0) + ")\">Edit</button></div></div>"
-    ).join("") : "No users";
-    document.getElementById("adminWithdrawals").innerHTML = data.withdrawals.length ? data.withdrawals.map(function(w) {
-      return "<div class=\"admin-row\"><div><b>" + escapeHtml(w.first_name || "User") + "</b><div style=\"font-size:11px;opacity:.55\">" + escapeHtml(w.method) + " · " + escapeHtml(w.address) + "</div></div><div style=\"text-align:right\"><div>" + Number(w.amount || 0) + " Coins</div><div style=\"font-size:11px;margin:3px 0\">" + escapeHtml(w.status) + "</div>" +
-        (w.status === "Pending" ? "<button class=\"admin-btn ok\" onclick=\"setWithdraw(" + Number(w.id) + ",\'Completed\')\">✓</button> <button class=\"admin-btn no\" onclick=\"setWithdraw(" + Number(w.id) + ",\'Cancelled\')\">×</button>" : "") +
-        "</div></div>";
-    }).join("") : "No withdrawals";
+    ADMIN_CACHE = data;
+
+    const stats = data.stats || {};
+    const statsEl = document.getElementById("adminStats");
+    if (statsEl) {
+      statsEl.innerHTML =
+        adminStat("Users", Number(stats.users_count || 0)) +
+        adminStat("Total Coins", Number(stats.total_balance || 0)) +
+        adminStat("Lifetime Earned", Number(stats.total_earned || 0)) +
+        adminStat("Withdrawn", Number(stats.total_withdrawn || 0)) +
+        adminStat("Pending Withdrawals", Number(stats.pending_withdrawals || 0)) +
+        adminStat("All Withdrawals", Number(stats.withdrawals_count || 0));
+    }
+
+    const settings = data.settings || {};
+    document.getElementById("admCurrency").value = settings.currency || "Coins";
+    document.getElementById("admReward").value = settings.adReward ?? 10;
+    document.getElementById("admLimit").value = settings.dailyAdLimit ?? 10;
+    document.getElementById("admMethods").value = settings.withdrawMethods || "";
+
+    renderAdminUsers(data.users || []);
+    renderAdminWithdrawals(data.withdrawals || []);
+    renderAdminTransactions(data.transactions || []);
   }
 
   window.editAdminBalance = async function (userId, current) {
-    const value = prompt("New balance:", String(current));
+    const value = prompt("Set new balance:", String(current));
     if (value === null) return;
     const balance = Number(value);
     if (!Number.isFinite(balance) || balance < 0) return showAlert("Invalid balance.");
-    const d = await adminRequest("balance", {user_id:userId,balance});
+    const d = await adminRequest("balance", {user_id:userId, mode:"set", value:balance});
+    showAlert(d.success ? "Balance updated." : (d.message || "Update failed."));
+    if (d.success) { await refreshAdmin(); await loadApp(); }
+  };
+
+  window.adjustAdminBalance = async function (userId, mode) {
+    const label = mode === "add" ? "Coins to add:" : "Coins to remove:";
+    const value = prompt(label, "10");
+    if (value === null) return;
+    const amount = Number(value);
+    if (!Number.isFinite(amount) || amount <= 0) return showAlert("Enter a valid amount greater than 0.");
+    const d = await adminRequest("balance", {user_id:userId, mode:mode, value:amount});
     showAlert(d.success ? "Balance updated." : (d.message || "Update failed."));
     if (d.success) { await refreshAdmin(); await loadApp(); }
   };
 
   window.setWithdraw = async function (withdrawalId, status) {
-    if (!confirm("Change withdrawal status to " + status + "?")) return;
-    const d = await adminRequest("withdraw_status", {withdrawal_id:withdrawalId,status});
-    showAlert(d.success ? "Withdrawal updated." : (d.message || "Update failed."));
+    const text = status === "Completed" ? "Approve this withdrawal?" : "Reject this withdrawal and return the Coins to the user?";
+    if (!confirm(text)) return;
+    const d = await adminRequest("withdraw_status", {withdrawal_id:withdrawalId,status:status});
+    showAlert(d.success ? (status === "Completed" ? "Withdrawal approved." : "Withdrawal rejected and Coins returned.") : (d.message || "Update failed."));
     if (d.success) { await refreshAdmin(); await loadApp(); }
   };
 
@@ -1415,8 +1596,9 @@ button{font-family:inherit}
       dailyAdLimit: Number(document.getElementById("admLimit").value),
       withdrawMethods: document.getElementById("admMethods").value.trim()
     };
-    const d = await adminRequest("settings", {settings});
+    const d = await adminRequest("settings", {settings:settings});
     showAlert(d.success ? "Settings saved." : (d.message || "Save failed."));
+    if (d.success) await refreshAdmin();
   };
 
   window.openOffers = function () {
