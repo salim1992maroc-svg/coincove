@@ -80,8 +80,40 @@ async function initSchema(db){
     }
   }
 
+  // Migrate the existing withdrawals table without replacing it. Older Coin Cove
+  // deployments may have a different withdrawal schema (for example amount
+  // instead of coins). SQLite CREATE TABLE IF NOT EXISTS does not alter an
+  // existing table, so the new withdrawal API must add only missing columns.
+  await ensureColumns(db, "withdrawals", {
+    method: "TEXT",
+    destination: "TEXT",
+    coins: "INTEGER",
+    usd_cents: "INTEGER",
+    status: "TEXT DEFAULT 'pending'",
+    created_at: "INTEGER",
+    updated_at: "INTEGER",
+    admin_note: "TEXT"
+  });
+
   // Do not create a partial index here. Email uniqueness is enforced by
   // email_credentials and by the explicit duplicate check in registration.
+}
+
+async function ensureColumns(db, table, definitions) {
+  const info = await db.prepare("PRAGMA table_info(" + table + ")").all();
+  const existing = new Set((info.results || []).map(function (row) { return String(row.name); }));
+
+  for (const [name, definition] of Object.entries(definitions)) {
+    if (existing.has(name)) continue;
+    try {
+      await db.prepare("ALTER TABLE " + table + " ADD COLUMN " + name + " " + definition).run();
+    } catch (e) {
+      const m = String(e?.message || e).toLowerCase();
+      if (!m.includes("duplicate column") && !m.includes("already exists")) {
+        console.error("Column migration failed:", table, name, e);
+      }
+    }
+  }
 }
 
 async function ensureSchema(env){ if(!env.DB) throw new Error("DB binding missing"); await initSchema(env.DB); }
