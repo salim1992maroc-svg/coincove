@@ -909,6 +909,10 @@ function json(data, status = 200) {
 }
 
 async function ensureAdminTables(db) {
+  // Keep this migration backward-compatible with older Coin Cove databases.
+  // The previous versions may already have a withdrawals table with a
+  // different set of columns. SQLite will not add missing columns when
+  // CREATE TABLE IF NOT EXISTS is used, so we explicitly verify them here.
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS app_settings (
       key TEXT PRIMARY KEY,
@@ -920,14 +924,33 @@ async function ensureAdminTables(db) {
     CREATE TABLE IF NOT EXISTS withdrawals (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
-      amount REAL NOT NULL,
-      method TEXT NOT NULL,
-      address TEXT NOT NULL,
+      amount REAL NOT NULL DEFAULT 0,
+      method TEXT NOT NULL DEFAULT '',
+      address TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT 'Pending',
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT 0,
       processed_at INTEGER
     )
   `).run();
+
+  const columns = await db.prepare(`PRAGMA table_info(withdrawals)`).all();
+  const names = new Set((columns.results || []).map(function (c) { return c.name; }));
+
+  const additions = [
+    ['user_id', `ALTER TABLE withdrawals ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0`],
+    ['amount', `ALTER TABLE withdrawals ADD COLUMN amount REAL NOT NULL DEFAULT 0`],
+    ['method', `ALTER TABLE withdrawals ADD COLUMN method TEXT NOT NULL DEFAULT ''`],
+    ['address', `ALTER TABLE withdrawals ADD COLUMN address TEXT NOT NULL DEFAULT ''`],
+    ['status', `ALTER TABLE withdrawals ADD COLUMN status TEXT NOT NULL DEFAULT 'Pending'`],
+    ['created_at', `ALTER TABLE withdrawals ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`],
+    ['processed_at', `ALTER TABLE withdrawals ADD COLUMN processed_at INTEGER`]
+  ];
+
+  for (const item of additions) {
+    if (!names.has(item[0])) {
+      await db.prepare(item[1]).run();
+    }
+  }
 
   await db.prepare(`
     CREATE INDEX IF NOT EXISTS idx_withdrawals_user
@@ -987,9 +1010,10 @@ async function adminApi(request, env) {
   await ensureAdminTables(env.DB);
 
   if (action === "data") {
-    const settings = await getAdminSettings(env.DB);
+    try {
+      const settings = await getAdminSettings(env.DB);
 
-    const users = await env.DB.prepare(`
+      const users = await env.DB.prepare(`
       SELECT u.id, u.telegram_id, u.username, u.first_name, u.last_name,
              COALESCE(w.balance,0) AS balance,
              COALESCE(w.lifetime_earned,0) AS lifetime_earned,
@@ -1026,14 +1050,22 @@ async function adminApi(request, env) {
       ORDER BY t.id DESC LIMIT 300
     `).all();
 
-    return json({
-      success:true,
-      settings,
-      stats: stats || {},
-      users: users.results || [],
-      withdrawals: withdrawals.results || [],
-      transactions: transactions.results || []
-    });
+      return json({
+        success:true,
+        settings,
+        stats: stats || {},
+        users: users.results || [],
+        withdrawals: withdrawals.results || [],
+        transactions: transactions.results || []
+      });
+    } catch (error) {
+      console.error("Coin Cove admin data error:", error);
+      return json({
+        success:false,
+        code:"ADMIN_DATA_ERROR",
+        message:"Admin database error. Please redeploy this Coin Cove version and try again."
+      },500);
+    }
   }
 
   if (action === "balance") {
