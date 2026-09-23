@@ -1382,9 +1382,13 @@ button{font-family:inherit}
     document.getElementById("admLimit").value = data.settings.dailyAdLimit ?? 10;
     document.getElementById("admMethods").value = data.settings.withdrawMethods || "";
     document.getElementById("adminUsers").innerHTML = data.users.length ? data.users.map(u =>
-      `<div class="admin-row"><div><b>${escapeHtml(u.first_name || "User")}</b><div style="font-size:11px;opacity:.55">TG: ${escapeHtml(u.telegram_id)}</div></div><div style="text-align:right"><div>${Number(u.balance||0)} Coins</div><button class="admin-btn primary" onclick="editAdminBalance(${Number(u.id)},${Number(u.balance||0)})">Edit</button></div></div>`).join("") : "No users";
-    document.getElementById("adminWithdrawals").innerHTML = data.withdrawals.length ? data.withdrawals.map(w =>
-      `<div class="admin-row"><div><b>${escapeHtml(w.first_name || "User")}</b><div style="font-size:11px;opacity:.55">${escapeHtml(w.method)} · ${escapeHtml(w.address)}</div></div><div style="text-align:right"><div>${Number(w.amount||0)} Coins</div><div style="font-size:11px;margin:3px 0">${escapeHtml(w.status)}</div>${w.status === "Pending" ? `<button class="admin-btn ok" onclick="setWithdraw(${Number(w.id)},'Completed')">✓</button> <button class="admin-btn no" onclick="setWithdraw(${Number(w.id)},'Cancelled')">×</button>` : ""}</div></div>`).join("") : "No withdrawals";
+      "<div class=\"admin-row\"><div><b>" + escapeHtml(u.first_name || "User") + "</b><div style=\"font-size:11px;opacity:.55\">TG: " + escapeHtml(u.telegram_id) + "</div></div><div style=\"text-align:right\"><div>" + Number(u.balance || 0) + " Coins</div><button class=\"admin-btn primary\" onclick=\"editAdminBalance(" + Number(u.id) + "," + Number(u.balance || 0) + ")\">Edit</button></div></div>"
+    ).join("") : "No users";
+    document.getElementById("adminWithdrawals").innerHTML = data.withdrawals.length ? data.withdrawals.map(function(w) {
+      return "<div class=\"admin-row\"><div><b>" + escapeHtml(w.first_name || "User") + "</b><div style=\"font-size:11px;opacity:.55\">" + escapeHtml(w.method) + " · " + escapeHtml(w.address) + "</div></div><div style=\"text-align:right\"><div>" + Number(w.amount || 0) + " Coins</div><div style=\"font-size:11px;margin:3px 0\">" + escapeHtml(w.status) + "</div>" +
+        (w.status === "Pending" ? "<button class=\"admin-btn ok\" onclick=\"setWithdraw(" + Number(w.id) + ",\'Completed\')\">✓</button> <button class=\"admin-btn no\" onclick=\"setWithdraw(" + Number(w.id) + ",\'Cancelled\')\">×</button>" : "") +
+        "</div></div>";
+    }).join("") : "No withdrawals";
   }
 
   window.editAdminBalance = async function (userId, current) {
