@@ -1244,10 +1244,16 @@ button,input,select{font:inherit}button{cursor:pointer}.wrap{max-width:720px;mar
 <body>
 <div id="app"><div class="wrap"><div class="card">Loading Coin Cove...</div></div></div>
 <script>
+try{document.getElementById('app').innerHTML='<div class=\"wrap\"><div class=\"card\">Starting Coin Cove...</div></div>'}catch(e){}
 const TAPJOY_SDK_KEY=${JSON.stringify(TAPJOY_SDK_KEY)};
 const TAPJOY_PLACEMENT=${JSON.stringify(TAPJOY_PLACEMENT)};
 const tg=window.Telegram&&window.Telegram.WebApp;
-let user=null,state=null,emailToken=localStorage.getItem('cc_email_token')||'',page='home';
+const storage={
+  get(k){try{return window.localStorage.getItem(k)||''}catch(e){console.warn('Storage read failed:',e);return ''}},
+  set(k,v){try{window.localStorage.setItem(k,v)}catch(e){console.warn('Storage write failed:',e)}},
+  remove(k){try{window.localStorage.removeItem(k)}catch(e){console.warn('Storage remove failed:',e)}}
+};
+let user=null,state=null,emailToken=storage.get('cc_email_token'),page='home';
 
 function esc(v){return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;")}
 async function api(path,opt={}){
@@ -1389,16 +1395,16 @@ function showRegister(){
 async function doLogin(){
  const d=await api('/api/auth/login',{method:'POST',body:JSON.stringify({email:le.value,password:lp.value})});
  if(!d.success){alert(d.message||'Login failed.');return}
- emailToken=d.token;localStorage.setItem('cc_email_token',emailToken);state=d;user=d.user;page='home';initTapjoy();render();
+ emailToken=d.token;storage.set('cc_email_token',emailToken);state=d;user=d.user;page='home';initTapjoy();render();
 }
 async function doRegister(){
  const d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({email:re.value,password:rp.value,confirmPassword:rc.value})});
  if(!d.success){alert(d.message||'Registration failed.');return}
- emailToken=d.token;localStorage.setItem('cc_email_token',emailToken);state=d;user=d.user;page='home';initTapjoy();render();
+ emailToken=d.token;storage.set('cc_email_token',emailToken);state=d;user=d.user;page='home';initTapjoy();render();
 }
 async function logout(){
  if(emailToken)await api('/api/auth/logout',{method:'POST'});
- emailToken='';localStorage.removeItem('cc_email_token');state=null;user=null;loginScreen();
+ emailToken='';storage.remove('cc_email_token');state=null;user=null;loginScreen();
 }
 async function boot(){
  const app=document.getElementById('app');
@@ -1408,7 +1414,7 @@ async function boot(){
      const d=await api('/api/auth/me');
      if(d.success){state=d;user=d.user;initTapjoy();render();return}
      emailToken='';
-     try{localStorage.removeItem('cc_email_token')}catch{}
+     try{storage.remove('cc_email_token')}catch{}
    }
    if(tg&&tg.initData){
      const d=await api('/api/me');
@@ -1423,7 +1429,7 @@ async function boot(){
    }
  }
 }
-boot();
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 </script>
 </body></html>`;
 }
@@ -1432,7 +1438,12 @@ function renderAdmin() {
   return String.raw`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Cove Admin</title>
 <style>body{font-family:Arial;margin:0;background:#f4f6f9;color:#111827}.wrap{max-width:1100px;margin:auto;padding:20px}.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;overflow:auto;box-shadow:0 5px 18px rgba(0,0,0,.05)}.input,.btn{padding:12px;border-radius:10px;border:1px solid #ddd}.btn{background:#111827;color:#fff;border:0;font-weight:700}.danger{background:#b91c1c}table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}</style></head><body><div class="wrap"><div id="app">Loading...</div></div>
 <script>
-let token=localStorage.getItem('cc_admin_token')||'';
+const storage={
+ get(k){try{return window.localStorage.getItem(k)||''}catch(e){console.warn('Storage read failed:',e);return ''}},
+ set(k,v){try{window.localStorage.setItem(k,v)}catch(e){console.warn('Storage write failed:',e)}},
+ remove(k){try{window.localStorage.removeItem(k)}catch(e){console.warn('Storage remove failed:',e)}}
+};
+let token=storage.get('cc_admin_token');
 const esc=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 async function api(p,o={}){
  const headers=Object.assign({'Content-Type':'application/json'},o.headers||{},token?{'Authorization':'Bearer '+token}:{});
@@ -1457,10 +1468,10 @@ async function boot(){
  }
 }
 function login(){document.getElementById('app').innerHTML='<div class="card"><h2>Coin Cove Admin</h2><input id="u" class="input" placeholder="Admin Username"><input id="p" class="input" type="password" placeholder="Admin Password"><button class="btn" onclick="doLogin()">Login</button></div>'}
-async function doLogin(){const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username:u.value,password:p.value})});if(!d.success)return alert(d.message);token=d.token;localStorage.setItem('cc_admin_token',token);dash()}
+async function doLogin(){const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username:u.value,password:p.value})});if(!d.success)return alert(d.message);token=d.token;storage.set('cc_admin_token',token);dash()}
 async function dash(){const [us,ws]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals')]);document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Users</h3><table><tr><th>ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(Number(x.usd_cents||0)/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\\'approve\\')">Approve</button> <button class="btn danger" onclick="act('+x.id+',\\'reject\\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}
 async function act(id,a){const d=await api('/api/admin/withdrawal',{method:'POST',body:JSON.stringify({id,action:a})});alert(d.message||'Done');dash()}
-async function logout(){await api('/api/admin/logout',{method:'POST'});localStorage.removeItem('cc_admin_token');token='';login()}
-boot();
+async function logout(){await api('/api/admin/logout',{method:'POST'});storage.remove('cc_admin_token');token='';login()}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 </script></body></html>`;
 }
