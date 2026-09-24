@@ -1,4 +1,5 @@
 const APP_NAME = "Coin Cove";
+const BUILD_VERSION = "2026-09-24-auth-fix-v6";
 const TAPJOY_SDK_KEY = "277Mt0yeQyuT_sZLoCUE_gEC0KXJGsauFETqGFqtLDz4ZQ0B_sGMBmpWRx1y";
 const TAPJOY_PLACEMENT = "coincover";
 const POINTS_NAME = "Coins";
@@ -18,10 +19,12 @@ export default {
         return json({
           success: true,
           app: APP_NAME,
+          version: BUILD_VERSION,
           database: !!env.DB,
           botConfigured: !!env.BOT_TOKEN,
           offerwallConfigured: !!env.OFFERWALL_SECRET,
           tapjoyConfigured: !!env.TAPJOY_VC_SECRET,
+          telegramWebhookConfigured: true,
           time: Date.now()
         });
       }
@@ -50,6 +53,8 @@ export default {
       if (url.pathname === "/api/admin/users") return adminUsers(request, env);
       if (url.pathname === "/api/admin/withdrawals") return adminWithdrawals(request, env);
       if (url.pathname === "/api/admin/withdrawal") return adminWithdrawalAction(request, env);
+      if (url.pathname === "/api/admin/telegram/setup") return telegramSetup(request, env);
+      if (url.pathname === "/api/telegram/webhook") return telegramWebhook(request, env);
 
       if (url.pathname === "/admin") {
         return new Response(renderAdmin(), {
@@ -430,6 +435,7 @@ async function getOrCreateTelegramUser(db, td) {
 }
 
 async function userPayload(db, userId, extra = {}) {
+  await db.prepare(`INSERT OR IGNORE INTO wallets(user_id,balance,lifetime_earned,lifetime_withdrawn,updated_at) VALUES(?,0,0,0,?)`).bind(userId, Math.floor(Date.now()/1000)).run();
   const w = await db.prepare("SELECT balance,lifetime_earned,lifetime_withdrawn FROM wallets WHERE user_id=?").bind(userId).first();
   const tx = await db.prepare(`
     SELECT type,amount,description,created_at FROM transactions
@@ -660,22 +666,22 @@ async function emailRegister(request, env) {
   if (!validEmail(email)) return json({ success: false, message: "Enter a valid email." }, 400);
   if (p.length < 8) return json({ success: false, message: "Password must be at least 8 characters." }, 400);
   if (p !== c) return json({ success: false, message: "Passwords do not match." }, 400);
-  if (await env.DB.prepare("SELECT user_id FROM email_credentials WHERE email=?").bind(email).first()) {
-    return json({ success: false, message: "Email is already registered." }, 409);
-  }
+  const existingCredential = await env.DB.prepare("SELECT user_id FROM email_credentials WHERE email=? LIMIT 1").bind(email).first();
+  if (existingCredential) return json({ success: false, message: "Email is already registered." }, 409);
 
   const now = Math.floor(Date.now() / 1000);
   const hash = await hashPassword(p);
   const syntheticTelegramId = "email:" + crypto.randomUUID();
 
-  let user;
+  let user = await env.DB.prepare("SELECT * FROM users WHERE email=? LIMIT 1").bind(email).first();
   try {
-    await env.DB.prepare(`
-      INSERT INTO users(telegram_id,email,first_name,referral_code,created_at,updated_at)
-      VALUES(?,?,?,?,?,?)
-    `).bind(syntheticTelegramId, email, "", generateReferralCode(), now, now).run();
-
-    user = await env.DB.prepare("SELECT * FROM users WHERE email=? LIMIT 1").bind(email).first();
+    if (!user) {
+      await env.DB.prepare(`
+        INSERT INTO users(telegram_id,email,first_name,referral_code,created_at,updated_at)
+        VALUES(?,?,?,?,?,?)
+      `).bind(syntheticTelegramId, email, "", generateReferralCode(), now, now).run();
+      user = await env.DB.prepare("SELECT * FROM users WHERE email=? LIMIT 1").bind(email).first();
+    }
     if (!user) throw new Error("Email account was not created.");
 
     await env.DB.batch([
@@ -796,15 +802,75 @@ async function createWithdrawal(request, env) {
 
 async function resolveUserAuth(request, env) {
   const init = getInitData(request);
-  if (init && env.BOT_TOKEN) {
+  // Keep Telegram and website authentication strictly separate.
+  // If Telegram initData is present, an invalid Telegram session must never
+  // fall back to an email session from the same browser.
+  if (init) {
+    if (!env.BOT_TOKEN) return null;
     const td = await validateTelegramInitData(init, env.BOT_TOKEN);
-    if (td) {
-      const u = await dbUserByTelegram(env.DB, String(td.user.id));
-      if (u) return { userId: u.id, auth: "telegram" };
-    }
+    if (!td) return null;
+    const u = await dbUserByTelegram(env.DB, String(td.user.id));
+    return u ? { userId: u.id, auth: "telegram" } : null;
   }
   const uid = await emailSessionUser(env.DB, request);
   return uid ? { userId: uid, auth: "email" } : null;
+}
+
+async function telegramSetup(request, env) {
+  if (request.method !== "POST") return json({ success: false, message: "Method not allowed." }, 405);
+  await ensureSchema(env);
+  if (!(await adminSession(env.DB, request))) return json({ success: false, message: "Not authenticated." }, 401);
+  if (!env.BOT_TOKEN) return json({ success: false, message: "BOT_TOKEN is not configured." }, 500);
+
+  const origin = new URL(request.url).origin;
+  const webhookUrl = String(env.TELEGRAM_WEBHOOK_URL || (origin + "/api/telegram/webhook"));
+  const webhookSecret = String(env.TELEGRAM_WEBHOOK_SECRET || ("cc_" + await sha256Hex(env.BOT_TOKEN + "|telegram-webhook")));
+  const body = { url: webhookUrl, drop_pending_updates: false, secret_token: webhookSecret };
+
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (!d?.ok) return json({ success: false, message: d?.description || "Telegram webhook setup failed." }, 502);
+    return json({ success: true, webhook: webhookUrl, description: d.description || "Webhook was set." });
+  } catch (e) {
+    console.error("Telegram webhook setup error:", e);
+    return json({ success: false, message: "Unable to contact Telegram right now." }, 502);
+  }
+}
+
+async function telegramWebhook(request, env) {
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  if (!env.BOT_TOKEN) return new Response("bot not configured", { status: 500 });
+  const expectedSecret = String(env.TELEGRAM_WEBHOOK_SECRET || ("cc_" + await sha256Hex(env.BOT_TOKEN + "|telegram-webhook")));
+  const gotSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+  if (!constantTimeEqual(gotSecret, expectedSecret)) return new Response("forbidden", { status: 403 });
+
+  let update;
+  try { update = await request.json(); } catch { return new Response("bad request", { status: 400 }); }
+  const msg = update?.message;
+  const chatId = msg?.chat?.id;
+  const text = String(msg?.text || "").trim();
+  if (!chatId) return new Response("ok", { status: 200 });
+
+  const botUrl = String(env.TELEGRAM_WEBAPP_URL || new URL(request.url).origin);
+  let reply = "🌊 Coin Cove\n\nOpen Coin Cove to earn Coins and manage your account.";
+  if (/^\/(start|help)\b/i.test(text) || text === "") {
+    reply = "🌊 Welcome to Coin Cove!\n\nTap the button below to open Coin Cove with your Telegram account.";
+  }
+
+  try {
+    await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId, text: reply,
+        reply_markup: { inline_keyboard: [[{ text: "🌊 Open Coin Cove", web_app: { url: botUrl } }]] }
+      })
+    });
+  } catch (e) { console.error("Telegram webhook sendMessage error:", e); }
+  return new Response("ok", { status: 200 });
 }
 
 async function adminLogin(request, env) {
@@ -1242,17 +1308,7 @@ button,input,select{font:inherit}button{cursor:pointer}.wrap{max-width:720px;mar
 </style>
 </head>
 <body>
-<div id="app"><div class="wrap"><div class="card" style="margin-top:8vh">
-<div class="brand">🌊 Coin Cove</div>
-<p class="muted">Sign in to earn Coins and request withdrawals.</p>
-<div class="actions">
-<input id="le" class="input" type="email" placeholder="Email" autocomplete="email">
-<input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password">
-<button class="btn" onclick="doLogin()">Login</button>
-<button class="btn secondary" onclick="showRegister()">Create account</button>
-</div>
-<p class="small" style="margin-top:14px">Coin Cove is starting…</p>
-</div></div></div>
+<div id="app"><div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">🌊 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div class="notice">Website accounts use <b>email + password</b>. Telegram Mini App accounts use <b>Telegram authorization</b>.</div><div class="actions" style="margin-top:14px"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>
 <script>
 const TAPJOY_SDK_KEY=${JSON.stringify(TAPJOY_SDK_KEY)};
 const TAPJOY_PLACEMENT=${JSON.stringify(TAPJOY_PLACEMENT)};
@@ -1267,8 +1323,8 @@ let user=null,state=null,emailToken=storage.get('cc_email_token'),page='home';
 function esc(v){return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;")}
 async function api(path,opt={}){
   const headers=Object.assign({'Content-Type':'application/json'},opt.headers||{});
-  if(emailToken)headers.Authorization='Bearer '+emailToken;
-  if(tg&&tg.initData)headers['X-Telegram-Init-Data']=tg.initData;
+  if(!tg?.initData && emailToken)headers.Authorization='Bearer '+emailToken;
+  if(tg?.initData)headers['X-Telegram-Init-Data']=tg.initData;
   const controller=new AbortController();
   const timeout=setTimeout(()=>controller.abort(),15000);
   try{
@@ -1307,10 +1363,10 @@ function render(){
     (page==='home'?homePage(balance):page==='offers'?offersPage():page==='withdraw'?withdrawPage(balance):accountPage())+
   '</div>'+
   '<div class="nav"><div class="navin">'+
-    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\\'home\\')">🏠<br>Home</button>'+
-    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\\'offers\\')">🎁<br>Offers</button>'+
-    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\\'withdraw\\')">💸<br>Withdraw</button>'+
-    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\\'account\\')">👤<br>Account</button>'+
+    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">🏠<br>Home</button>'+
+    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">🎁<br>Offers</button>'+
+    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">💸<br>Withdraw</button>'+
+    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">👤<br>Account</button>'+
   '</div></div>';
 }
 function homePage(balance){
@@ -1333,10 +1389,10 @@ function offersPage(){
  return '<div class="card"><h2>Offerwalls</h2><div class="notice">Complete eligible offers. Rewards are credited by each provider after its server callback is received.</div></div>'+
  '<div class="card"><div class="actions">'+
  '<button class="offer" onclick="showTapjoy()"><strong>⚡ Tapjoy</strong><span class="small">Open Tapjoy Web Offerwall</span></button>'+
- '<button class="offer" onclick="openProvider(\\'cpidroid\\')"><strong>🎯 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\\'notik\\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\\'admantum\\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\\'offerwallgg\\')"><strong>🎁 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'cpidroid\')"><strong>🎯 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'notik\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'admantum\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'offerwallgg\')"><strong>🎁 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
  '</div></div>';
 }
 function openOffers(){page='offers';render()}
@@ -1394,22 +1450,34 @@ async function reload(){
  state=d;user=d.user;initTapjoy();
 }
 function loginScreen(){
- document.getElementById('app').innerHTML='<div class="wrap"><div class="card" style="margin-top:12vh"><div class="brand">🌊 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div id="authbox">'+
- '<div class="actions"><input id="le" class="input" type="email" placeholder="Email"><input id="lp" class="input" type="password" placeholder="Password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div>'+
- '</div></div></div>';
+ const app=document.getElementById('app');
+ if(tg&&tg.initData){
+   app.innerHTML='<div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">🌊 Coin Cove</div><h2>Telegram account</h2><p class="muted">This Mini App uses your Telegram account. Email/password login is disabled here.</p><div class="notice">If Telegram authorization is unavailable, close and reopen Coin Cove from <b>@Covecoinbot</b>.</div><button class="btn" style="margin-top:12px" onclick="location.reload()">Retry Telegram login</button></div></div>';
+   return;
+ }
+ app.innerHTML='<div class="wrap"><div class="card" style="margin-top:12vh"><div class="brand">🌊 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div id="authbox"><div class="actions"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>';
 }
 function showRegister(){
  document.getElementById('authbox').innerHTML='<div class="actions"><input id="re" class="input" type="email" placeholder="Email"><input id="rp" class="input" type="password" placeholder="Password (8+ characters)"><input id="rc" class="input" type="password" placeholder="Confirm password"><button class="btn" onclick="doRegister()">Create account</button><button class="btn secondary" onclick="loginScreen()">Back to login</button></div>';
 }
 async function doLogin(){
- const d=await api('/api/auth/login',{method:'POST',body:JSON.stringify({email:le.value,password:lp.value})});
+ if(tg&&tg.initData){loginScreen();return}
+ const email=document.getElementById('le')?.value.trim()||'';
+ const password=document.getElementById('lp')?.value||'';
+ if(!email||!password){alert('Enter your email and password.');return}
+ const d=await api('/api/auth/login',{method:'POST',body:JSON.stringify({email,password})});
  if(!d.success){alert(d.message||'Login failed.');return}
- emailToken=d.token;storage.set('cc_email_token',emailToken);state=d;user=d.user;page='home';initTapjoy();render();
+ emailToken=d.token||'';storage.set('cc_email_token',emailToken);state=d;user=d.user;page='home';initTapjoy();render();
 }
 async function doRegister(){
- const d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({email:re.value,password:rp.value,confirmPassword:rc.value})});
+ if(tg&&tg.initData){loginScreen();return}
+ const email=document.getElementById('re')?.value.trim()||'';
+ const password=document.getElementById('rp')?.value||'';
+ const confirmPassword=document.getElementById('rc')?.value||'';
+ if(!email||!password||!confirmPassword){alert('Complete all fields.');return}
+ const d=await api('/api/auth/register',{method:'POST',body:JSON.stringify({email,password,confirmPassword})});
  if(!d.success){alert(d.message||'Registration failed.');return}
- emailToken=d.token;storage.set('cc_email_token',emailToken);state=d;user=d.user;page='home';initTapjoy();render();
+ emailToken=d.token||'';if(emailToken)storage.set('cc_email_token',emailToken);state=d;user=d.user;page='home';initTapjoy();render();
 }
 async function logout(){
  if(emailToken)await api('/api/auth/logout',{method:'POST'});
@@ -1419,23 +1487,24 @@ async function boot(){
  const app=document.getElementById('app');
  try{
    if(tg){try{tg.ready();tg.expand()}catch(e){console.warn('Telegram WebApp init warning:',e)}}
-   if(emailToken){
-     const d=await api('/api/auth/me');
-     if(d.success){state=d;user=d.user;initTapjoy();render();return}
-     emailToken='';
-     try{storage.remove('cc_email_token')}catch{}
-   }
+   // Telegram Mini App: Telegram auth ONLY.
    if(tg&&tg.initData){
      const d=await api('/api/me');
      if(d.success){state=d;user=d.user;initTapjoy();render();return}
      console.warn('Telegram authentication failed:',d);
+     loginScreen();
+     return;
+   }
+   // Normal website: email/password auth ONLY.
+   if(emailToken){
+     const d=await api('/api/auth/me');
+     if(d.success){state=d;user=d.user;initTapjoy();render();return}
+     emailToken='';storage.remove('cc_email_token');
    }
    loginScreen();
  }catch(e){
    console.error('Boot error:',e);
-   if(app){
-     app.innerHTML='<div class=\"wrap\"><div class=\"card error-card\"><h3>Unable to load Coin Cove</h3><div class=\"small\">'+esc(e?.message||'Unexpected error.')+'</div><button class=\"btn\" onclick=\"location.reload()\">Retry</button></div></div>';
-   }
+   if(app)app.innerHTML='<div class="wrap"><div class="card error-card"><h3>Unable to load Coin Cove</h3><div class="small">'+esc(e?.message||'Unexpected error.')+'</div><button class="btn" onclick="location.reload()">Retry</button></div></div>';
  }
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
@@ -1445,7 +1514,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 
 function renderAdmin() {
   return String.raw`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Cove Admin</title>
-<style>body{font-family:Arial;margin:0;background:#f4f6f9;color:#111827}.wrap{max-width:1100px;margin:auto;padding:20px}.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;overflow:auto;box-shadow:0 5px 18px rgba(0,0,0,.05)}.input,.btn{padding:12px;border-radius:10px;border:1px solid #ddd}.btn{background:#111827;color:#fff;border:0;font-weight:700}.danger{background:#b91c1c}table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}</style></head><body><div class="wrap"><div id="app">Loading...</div></div>
+<style>body{font-family:Arial;margin:0;background:#f4f6f9;color:#111827}.wrap{max-width:1100px;margin:auto;padding:20px}.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;overflow:auto;box-shadow:0 5px 18px rgba(0,0,0,.05)}.input,.btn{padding:12px;border-radius:10px;border:1px solid #ddd}.btn{background:#111827;color:#fff;border:0;font-weight:700}.danger{background:#b91c1c}table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}</style></head><body><div class="wrap"><div id="app"><div class="card"><h2>Coin Cove Admin</h2><p>Admin login</p><input id="adminUser" class="input" placeholder="Admin Username" autocomplete="username"><input id="adminPass" class="input" type="password" placeholder="Admin Password" autocomplete="current-password"><button class="btn" style="margin-top:10px" onclick="doLogin()">Login</button><p class="small" style="margin-top:10px">Build 2026-09-24-auth-fix-v5</p></div></div></div>
 <script>
 const storage={
  get(k){try{return window.localStorage.getItem(k)||''}catch(e){console.warn('Storage read failed:',e);return ''}},
@@ -1476,9 +1545,10 @@ async function boot(){
    document.getElementById('app').innerHTML='<div class="card"><h2>Unable to load Admin</h2><p>'+esc(e?.message||'Unexpected error.')+'</p><button class="btn" onclick="location.reload()">Retry</button></div>';
  }
 }
-function login(){document.getElementById('app').innerHTML='<div class="card"><h2>Coin Cove Admin</h2><input id="u" class="input" placeholder="Admin Username"><input id="p" class="input" type="password" placeholder="Admin Password"><button class="btn" onclick="doLogin()">Login</button></div>'}
-async function doLogin(){const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username:u.value,password:p.value})});if(!d.success)return alert(d.message);token=d.token;storage.set('cc_admin_token',token);dash()}
-async function dash(){const [us,ws]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals')]);document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Users</h3><table><tr><th>ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(Number(x.usd_cents||0)/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\\'approve\\')">Approve</button> <button class="btn danger" onclick="act('+x.id+',\\'reject\\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}
+function login(){document.getElementById('app').innerHTML='<div class="card"><h2>Coin Cove Admin</h2><input id="adminUser" class="input" placeholder="Admin Username" autocomplete="username"><input id="adminPass" class="input" type="password" placeholder="Admin Password" autocomplete="current-password"><button class="btn" style="margin-top:10px" onclick="doLogin()">Login</button></div>'}
+async function doLogin(){const username=document.getElementById('adminUser')?.value.trim()||'';const password=document.getElementById('adminPass')?.value||'';if(!username||!password){alert('Enter admin username and password.');return}const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username,password})});if(!d.success)return alert(d.message||'Admin login failed.');token=d.token;storage.set('cc_admin_token',token);dash()}
+async function dash(){const [us,ws]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals')]);if(!us.success||!ws.success){document.getElementById('app').innerHTML='<div class="card"><h2>Admin data could not be loaded</h2><p>'+esc(us.message||ws.message||'Please try again.')+'</p><button class="btn" onclick="dash()">Retry</button><button class="btn secondary" style="margin-top:8px" onclick="logout()">Back to login</button></div>';return}document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Telegram Bot</h3><p>Connect the bot webhook so /start opens Coin Cove in Telegram.</p><button class="btn" onclick="setupTelegram()">Connect Telegram Bot</button><span id="tgSetupStatus" class="small" style="margin-left:8px"></span></div><div class="card"><h3>Users</h3><table><tr><th>ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(Number(x.usd_cents||0)/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\'approve\')">Approve</button> <button class="btn danger" onclick="act('+x.id+',\'reject\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}
+async function setupTelegram(){const el=document.getElementById('tgSetupStatus');if(el)el.textContent='Connecting...';const d=await api('/api/admin/telegram/setup',{method:'POST'});if(el)el.textContent=d.success?'Connected':'Failed';alert(d.message||d.description||(d.success?'Telegram webhook connected.':'Telegram setup failed.'));}
 async function act(id,a){const d=await api('/api/admin/withdrawal',{method:'POST',body:JSON.stringify({id,action:a})});alert(d.message||'Done');dash()}
 async function logout(){await api('/api/admin/logout',{method:'POST'});storage.remove('cc_admin_token');token='';login()}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
