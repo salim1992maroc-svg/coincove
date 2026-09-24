@@ -1238,6 +1238,7 @@ button,input,select{font:inherit}button{cursor:pointer}.wrap{max-width:720px;mar
 .notice{padding:12px 14px;border-radius:13px;background:#0f1f38;color:#cbd5e1;font-size:13px}
 .hidden{display:none!important}h2,h3{margin:0 0 10px}.title{font-size:17px;font-weight:900;margin-bottom:8px}
 @media(max-width:430px){.balance{font-size:35px}.wrap{padding-left:11px;padding-right:11px}.card{padding:15px}}
+.error-card{text-align:center}.error-card h3{margin-top:0}.error-card .btn{margin-top:16px}
 </style>
 </head>
 <body>
@@ -1253,9 +1254,17 @@ async function api(path,opt={}){
   const headers=Object.assign({'Content-Type':'application/json'},opt.headers||{});
   if(emailToken)headers.Authorization='Bearer '+emailToken;
   if(tg&&tg.initData)headers['X-Telegram-Init-Data']=tg.initData;
-  const r=await fetch(path,Object.assign({},opt,{headers}));
-  let d;try{d=await r.json()}catch{d={success:false,message:'Server response was invalid.'}}
-  return d;
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),15000);
+  try{
+    const r=await fetch(path,Object.assign({},opt,{headers,signal:controller.signal}));
+    let d;try{d=await r.json()}catch{d={success:false,message:'Server response was invalid.'}}
+    if(!r.ok && !d.message)d.message='Request failed ('+r.status+').';
+    return d;
+  }catch(e){
+    console.error('API request failed:',path,e);
+    return {success:false,code:e?.name==='AbortError'?'TIMEOUT':'NETWORK_ERROR',message:e?.name==='AbortError'?'The server took too long to respond.':'Unable to connect to the server.'};
+  }finally{clearTimeout(timeout)}
 }
 function initTapjoy(){
   if(!user||typeof window.Tapjoy!=='function')return;
@@ -1392,16 +1401,27 @@ async function logout(){
  emailToken='';localStorage.removeItem('cc_email_token');state=null;user=null;loginScreen();
 }
 async function boot(){
- if(tg){try{tg.ready();tg.expand()}catch{}}
- if(tg&&tg.initData){
-   const d=await api('/api/me');
-   if(d.success){state=d;user=d.user;initTapjoy();render();return}
+ const app=document.getElementById('app');
+ try{
+   if(tg){try{tg.ready();tg.expand()}catch(e){console.warn('Telegram WebApp init warning:',e)}}
+   if(emailToken){
+     const d=await api('/api/auth/me');
+     if(d.success){state=d;user=d.user;initTapjoy();render();return}
+     emailToken='';
+     try{localStorage.removeItem('cc_email_token')}catch{}
+   }
+   if(tg&&tg.initData){
+     const d=await api('/api/me');
+     if(d.success){state=d;user=d.user;initTapjoy();render();return}
+     console.warn('Telegram authentication failed:',d);
+   }
+   loginScreen();
+ }catch(e){
+   console.error('Boot error:',e);
+   if(app){
+     app.innerHTML='<div class=\"wrap\"><div class=\"card error-card\"><h3>Unable to load Coin Cove</h3><div class=\"small\">'+esc(e?.message||'Unexpected error.')+'</div><button class=\"btn\" onclick=\"location.reload()\">Retry</button></div></div>';
+   }
  }
- if(emailToken){
-   const d=await api('/api/auth/me');
-   if(d.success){state=d;user=d.user;initTapjoy();render();return}
- }
- loginScreen();
 }
 boot();
 </script>
@@ -1414,8 +1434,28 @@ function renderAdmin() {
 <script>
 let token=localStorage.getItem('cc_admin_token')||'';
 const esc=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
-async function api(p,o={}){o.headers=Object.assign({'Content-Type':'application/json'},o.headers||{},token?{'Authorization':'Bearer '+token}:{});const r=await fetch(p,o);return r.json()}
-async function boot(){const m=await api('/api/admin/me');if(!m.success){login();return}dash()}
+async function api(p,o={}){
+ const headers=Object.assign({'Content-Type':'application/json'},o.headers||{},token?{'Authorization':'Bearer '+token}:{});
+ const controller=new AbortController();
+ const timeout=setTimeout(()=>controller.abort(),15000);
+ try{
+   const r=await fetch(p,Object.assign({},o,{headers,signal:controller.signal}));
+   let d;try{d=await r.json()}catch{d={success:false,message:'Server response was invalid.'}}
+   if(!r.ok&&!d.message)d.message='Request failed ('+r.status+').';
+   return d;
+ }catch(e){
+   return {success:false,code:e?.name==='AbortError'?'TIMEOUT':'NETWORK_ERROR',message:e?.name==='AbortError'?'The server took too long to respond.':'Unable to connect to the server.'};
+ }finally{clearTimeout(timeout)}
+}
+async function boot(){
+ try{
+   const m=await api('/api/admin/me');
+   if(!m.success){login();return}
+   dash();
+ }catch(e){
+   document.getElementById('app').innerHTML='<div class="card"><h2>Unable to load Admin</h2><p>'+esc(e?.message||'Unexpected error.')+'</p><button class="btn" onclick="location.reload()">Retry</button></div>';
+ }
+}
 function login(){document.getElementById('app').innerHTML='<div class="card"><h2>Coin Cove Admin</h2><input id="u" class="input" placeholder="Admin Username"><input id="p" class="input" type="password" placeholder="Admin Password"><button class="btn" onclick="doLogin()">Login</button></div>'}
 async function doLogin(){const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username:u.value,password:p.value})});if(!d.success)return alert(d.message);token=d.token;localStorage.setItem('cc_admin_token',token);dash()}
 async function dash(){const [us,ws]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals')]);document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Users</h3><table><tr><th>ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(Number(x.usd_cents||0)/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\\'approve\\')">Approve</button> <button class="btn danger" onclick="act('+x.id+',\\'reject\\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}
