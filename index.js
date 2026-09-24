@@ -16,6 +16,361 @@ export default {
       if (url.pathname === "/api/referral") return apiReferral(request, env);
       if (url.pathname === "/api/reward-ad") return rewardAd(request, env);
       if (url.pathname === "/api/offerwall/postback") return offerwallPostback(request, env);
+      if (url.pathname === "/api/offerwall/cpidroid/postback") return cpidroidPostback(request, env);
+      if (url.pathname === "/api/offerwall/notik/postback") return notikPostback(request, env);
+      if (url.pathname === "/api/offerwall/admantum/postback") return admantumPostback(request, env);
+      async function cpidroidPostback(request, env) {
+  if (request.method !== "GET") {
+    return new Response("Method not allowed", { status: 405 });
+  }
+
+  return processProviderPostback(request, env, "cpidroid", {
+    userParam: "user_id",
+    transactionParam: "txn_id",
+    amountParam: "payout_vc",
+    offerIdParam: "offer_id",
+    offerNameParam: "offer_name",
+    payoutUsdParam: "payout_usd"
+  });
+}
+
+async function notikPostback(request, env) {
+  if (request.method !== "GET") {
+    return new Response("Method not allowed", { status: 405 });
+  }
+
+  const q = new URL(request.url).searchParams;
+
+  /*
+   * Notik automatically supplies its normal postback parameters.
+   * We accept the normal names first and a few common aliases so the
+   * endpoint remains compatible if the Notik dashboard uses a different
+   * generated name.
+   */
+  const userId =
+    (q.get("user_id") ||
+     q.get("userid") ||
+     q.get("uid") ||
+     "").trim();
+
+  const transactionId =
+    (q.get("txn_id") ||
+     q.get("transaction_id") ||
+     q.get("trans_id") ||
+     q.get("txid") ||
+     "").trim();
+
+  const rawAmount =
+    q.get("virtual_currency") ??
+    q.get("payout_vc") ??
+    q.get("amount") ??
+    q.get("reward") ??
+    q.get("coins");
+
+  if (!userId || !transactionId || rawAmount === null) {
+    return new Response("bad request", { status: 400 });
+  }
+
+  return processProviderPostback(request, env, "notik", {
+    suppliedUserId: userId,
+    suppliedTransactionId: transactionId,
+    suppliedAmount: rawAmount,
+    userParam: "user_id",
+    transactionParam: "txn_id",
+    amountParam: "virtual_currency",
+    offerIdParam: "offer_id",
+    offerNameParam: "offer_name",
+    payoutUsdParam: "payout_usd"
+  });
+}
+
+async function admantumPostback(request, env) {
+  if (request.method !== "GET") {
+    return new Response("Method not allowed", { status: 405 });
+  }
+
+  return processProviderPostback(request, env, "admantum", {
+    userParam: "userid",
+    transactionParam: "trans_id",
+    amountParam: "amount",
+    offerIdParam: "trans_id",
+    offerNameParam: "placement",
+    payoutUsdParam: "payout_usd"
+  });
+}
+
+async function processProviderPostback(request, env, provider, config) {
+  if (!env.DB || !env.OFFERWALL_SECRET) {
+    return new Response("server configuration error", { status: 500 });
+  }
+
+  await ensureSchema(env);
+
+  const q = new URL(request.url).searchParams;
+
+  /*
+   * Every provider receives the same private Coin Cove secret.
+   * The provider callback URL must contain:
+   *
+   * ?secret=YOUR_OFFERWALL_SECRET
+   */
+  const receivedSecret = (q.get("secret") || "").trim();
+
+  if (!receivedSecret) {
+    return new Response("missing secret", { status: 403 });
+  }
+
+  if (!constantTimeEqual(receivedSecret, String(env.OFFERWALL_SECRET))) {
+    return new Response("invalid secret", { status: 403 });
+  }
+
+  const userId = String(
+    config.suppliedUserId ??
+    q.get(config.userParam) ??
+    ""
+  ).trim();
+
+  const transactionId = String(
+    config.suppliedTransactionId ??
+    q.get(config.transactionParam) ??
+    ""
+  ).trim();
+
+  const rawAmount =
+    config.suppliedAmount ??
+    q.get(config.amountParam);
+
+  if (!userId || !transactionId || rawAmount === null || rawAmount === undefined) {
+    return new Response("bad request", { status: 400 });
+  }
+
+  /*
+   * The canonical Coin Cove UID is users.id.
+   * This intentionally does NOT use Telegram ID or email address.
+   */
+  const user = await dbUserByDatabaseId(env.DB, userId);
+
+  if (!user) {
+    return new Response("unknown user", { status: 404 });
+  }
+
+  let amount = Number(rawAmount);
+
+  if (!Number.isFinite(amount)) {
+    return new Response("invalid amount", { status: 400 });
+  }
+
+  /*
+   * Coins are integers in the existing Coin Cove wallet.
+   * Provider virtual-currency amounts therefore have to resolve
+   * to a whole number before entering the wallet.
+   */
+  amount = Math.trunc(amount);
+
+  if (amount === 0) {
+    return new Response("ok", { status: 200 });
+  }
+
+  const providerTransactionId = provider + ":" + transactionId;
+
+  const now = Math.floor(Date.now() / 1000);
+
+  const offerId =
+    q.get(config.offerIdParam || "") ||
+    q.get("offer_id") ||
+    null;
+
+  const offerName =
+    q.get(config.offerNameParam || "") ||
+    q.get("offer_name") ||
+    q.get("of_name") ||
+    null;
+
+  const payoutUsdRaw =
+    q.get(config.payoutUsdParam || "") ||
+    q.get("payout_usd") ||
+    q.get("payoutUsd") ||
+    "0";
+
+  const payoutUsd = Number(payoutUsdRaw);
+
+  const safePayoutUsd =
+    Number.isFinite(payoutUsd) && payoutUsd >= 0
+      ? payoutUsd
+      : 0;
+
+  /*
+   * Negative provider amounts are treated as reversals.
+   * Positive amounts are credits.
+   */
+  if (amount > 0) {
+    try {
+      await env.DB.batch([
+        env.DB.prepare(`
+          INSERT INTO offerwall_conversions
+          (
+            transaction_id,
+            user_id,
+            amount,
+            status,
+            offer_id,
+            offer_name,
+            goal_id,
+            payout_usd,
+            test,
+            created_at
+          )
+          VALUES(?,?,?,?,?,?,?,?,?,?)
+        `).bind(
+          providerTransactionId,
+          user.id,
+          amount,
+          "credited",
+          offerId,
+          offerName,
+          null,
+          safePayoutUsd,
+          0,
+          now
+        ),
+
+        env.DB.prepare(`
+          UPDATE wallets
+          SET
+            balance = balance + ?,
+            lifetime_earned = lifetime_earned + ?,
+            updated_at = ?
+          WHERE user_id = ?
+        `).bind(
+          amount,
+          amount,
+          now,
+          user.id
+        ),
+
+        env.DB.prepare(`
+          INSERT INTO transactions
+          (
+            user_id,
+            type,
+            amount,
+            description,
+            created_at
+          )
+          VALUES(?,?,?,?,?)
+        `).bind(
+          user.id,
+          provider + "_offer_reward",
+          amount,
+          provider.toUpperCase() + " offer reward",
+          now
+        )
+      ]);
+    } catch (e) {
+      const message = String(e?.message || e).toLowerCase();
+
+      /*
+       * Duplicate transaction means the provider retried the same
+       * conversion. It must NOT credit the user twice.
+       */
+      if (
+        message.includes("unique") ||
+        message.includes("constraint")
+      ) {
+        return new Response("ok", { status: 200 });
+      }
+
+      console.error(provider + " credit error:", e);
+      return new Response("server error", { status: 500 });
+    }
+
+    return new Response("ok", { status: 200 });
+  }
+
+  /*
+   * Reversal.
+   */
+  const original = await env.DB
+    .prepare(`
+      SELECT amount,status
+      FROM offerwall_conversions
+      WHERE transaction_id=?
+      LIMIT 1
+    `)
+    .bind(providerTransactionId)
+    .first();
+
+  if (!original) {
+    return new Response("ok", { status: 200 });
+  }
+
+  if (String(original.status).toLowerCase() === "reversed") {
+    return new Response("ok", { status: 200 });
+  }
+
+  const reversal = -Math.abs(Number(original.amount));
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`
+        UPDATE offerwall_conversions
+        SET status=?
+        WHERE transaction_id=?
+      `).bind(
+        "reversed",
+        providerTransactionId
+      ),
+
+      env.DB.prepare(`
+        UPDATE wallets
+        SET
+          balance = MAX(0, balance + ?),
+          updated_at = ?
+        WHERE user_id = ?
+      `).bind(
+        reversal,
+        now,
+        user.id
+      ),
+
+      env.DB.prepare(`
+        INSERT INTO transactions
+        (
+          user_id,
+          type,
+          amount,
+          description,
+          created_at
+        )
+        VALUES(?,?,?,?,?)
+      `).bind(
+        user.id,
+        provider + "_offer_reversal",
+        reversal,
+        provider.toUpperCase() + " offer reversal",
+        now
+      )
+    ]);
+  } catch (e) {
+    console.error(provider + " reversal error:", e);
+    return new Response("server error", { status: 500 });
+  }
+
+  return new Response("ok", { status: 200 });
+}
+
+async function dbUserByDatabaseId(db, id) {
+  const numericId = Number(id);
+
+  if (!Number.isInteger(numericId) || numericId <= 0) {
+    return null;
+  }
+
+  return db
+    .prepare("SELECT * FROM users WHERE id=? LIMIT 1")
+    .bind(numericId)
+    .first();
+}
       if (url.pathname === "/monetag/postback") return monetagPostback(request, env);
       if (url.pathname === "/api/auth/register") return emailRegister(request, env);
       if (url.pathname === "/api/auth/login") return emailLogin(request, env);
@@ -313,6 +668,98 @@ function json(data,status=200){return new Response(JSON.stringify(data),{status,
 
 function renderApp(){return String.raw`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0f172a"><title>Coin Cove</title><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="https://libtl.com/sdk.js" data-zone="11766606" data-sdk="show_11766606"></script><style>
 *{box-sizing:border-box}html,body{margin:0;min-height:100%;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f4f7fb;color:#101828}body{min-height:100vh}.app{width:100%;max-width:980px;margin:0 auto;padding:28px 22px calc(110px + env(safe-area-inset-bottom))}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}.brand{display:flex;align-items:center;gap:11px;font-size:24px;font-weight:850;letter-spacing:-.5px}.brand-icon{width:44px;height:44px;border-radius:14px;background:#111827;color:#fff;display:grid;place-items:center;font-size:23px;box-shadow:0 8px 22px #11182722}.pill{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;background:#e8edf5;color:#475467;font-size:12px;font-weight:750}.hero{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(280px,.6fr);gap:18px;margin-bottom:18px}.balance{background:linear-gradient(135deg,#111827,#25324a);color:#fff;border-radius:28px;padding:28px;min-height:190px;display:flex;flex-direction:column;justify-content:space-between;box-shadow:0 18px 45px #10182820}.welcome{font-size:15px;opacity:.78}.balance-row{display:flex;align-items:end;justify-content:space-between;gap:18px}.num{font-size:54px;line-height:1;font-weight:900;letter-spacing:-2px}.coins-label{font-size:14px;opacity:.72;margin-top:7px}.account-card{background:#fff;border:1px solid #e7ebf2;border-radius:24px;padding:24px;box-shadow:0 10px 30px #1018280b;display:flex;flex-direction:column;justify-content:center}.account-card h3{margin:0 0 7px;font-size:18px}.account-card p{margin:0;color:#667085;font-size:14px;line-height:1.5}.section-title{font-size:18px;font-weight:850;margin:24px 0 12px}.actions{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.action{border:1px solid #e4e9f1;background:#fff;border-radius:22px;padding:20px 15px;text-align:left;min-height:112px;cursor:pointer;box-shadow:0 8px 24px #1018280a;transition:.15s}.action:active{transform:scale(.98)}.action-icon{font-size:25px;margin-bottom:12px}.action strong{display:block;font-size:15px}.action span{display:block;color:#667085;font-size:12px;margin-top:5px}.card{background:#fff;border:1px solid #e7ebf2;border-radius:24px;padding:22px;margin-top:16px;box-shadow:0 10px 30px #1018280a}.card h3{margin:0 0 12px;font-size:18px}.activity{display:grid;gap:10px}.activity-item{display:flex;justify-content:space-between;gap:15px;padding:12px 0;border-bottom:1px solid #edf0f4;font-size:14px}.activity-item:last-child{border-bottom:0}.muted{color:#667085;font-size:13px}.positive{font-weight:800}.empty{padding:22px;text-align:center;color:#667085;background:#f8fafc;border-radius:16px}.nav{position:fixed;z-index:20;left:50%;bottom:14px;transform:translateX(-50%);width:min(760px,calc(100% - 24px));background:#111827;color:#fff;border-radius:22px;padding:9px;display:grid;grid-template-columns:repeat(4,1fr);gap:5px;box-shadow:0 16px 45px #10182835}.nav button{border:0;background:transparent;color:#d8dee9;border-radius:15px;padding:11px 6px;font-weight:750;font-size:12px;cursor:pointer}.nav button.active{background:#fff;color:#111827}.btn{width:100%;border:0;border-radius:14px;padding:14px 16px;font-weight:800;background:#111827;color:#fff;cursor:pointer}.btn.secondary{background:#eef2f7;color:#111827}.btn:disabled{opacity:.55;cursor:not-allowed}.input,.select{width:100%;padding:14px 15px;border:1px solid #d9dee8;border-radius:14px;margin:6px 0;background:#fff;font-size:15px;outline:none}.input:focus,.select:focus{border-color:#111827;box-shadow:0 0 0 3px #11182712}.modal{position:fixed;z-index:50;inset:0;background:#10182899;display:flex;align-items:flex-end;padding:12px}.sheet{background:#fff;border-radius:28px 28px 18px 18px;padding:24px;width:100%;max-width:720px;margin:auto;max-height:92vh;overflow:auto;box-shadow:0 -12px 40px #10182825}.sheet h2,.sheet h3{margin-top:0}.close-row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.close{border:0;background:#eef2f7;border-radius:12px;padding:9px 12px;font-weight:800}.auth-page{min-height:calc(100vh - 56px);display:grid;place-items:center;padding:28px 0}.auth-wrap{width:100%;max-width:500px}.auth-logo{text-align:center;margin-bottom:18px}.auth-logo .brand{justify-content:center;font-size:30px}.auth-card{background:#fff;border:1px solid #e5e9f0;border-radius:30px;padding:30px;box-shadow:0 20px 60px #10182812}.auth-card h1{margin:0;font-size:28px;letter-spacing:-.7px}.auth-card .sub{color:#667085;line-height:1.55;margin:8px 0 22px}.tabs{display:grid;grid-template-columns:1fr 1fr;background:#f2f4f7;border-radius:14px;padding:4px;margin-bottom:18px}.tabs button{border:0;background:transparent;padding:11px;border-radius:11px;font-weight:800;color:#667085}.tabs button.active{background:#fff;color:#111827;box-shadow:0 2px 8px #10182812}.auth-note{font-size:12px;color:#667085;text-align:center;margin-top:15px;line-height:1.5}.status{min-height:22px;margin:9px 0;font-size:13px;color:#b42318}.status.ok{color:#067647}.divider{height:1px;background:#edf0f4;margin:20px 0}.email-line{display:flex;align-items:center;gap:8px;color:#667085;font-size:13px;word-break:break-word}.hidden{display:none!important}@media(max-width:760px){.app{padding:18px 14px calc(105px + env(safe-area-inset-bottom))}.hero{grid-template-columns:1fr}.balance{min-height:175px;padding:23px}.num{font-size:46px}.actions{grid-template-columns:1fr 1fr;gap:10px}.action{min-height:100px;padding:17px}.topbar{margin-bottom:14px}.brand{font-size:21px}.brand-icon{width:40px;height:40px}.account-card{padding:19px}.auth-page{padding:12px 0}.auth-card{padding:22px;border-radius:24px}.auth-card h1{font-size:25px}.nav{bottom:9px;width:calc(100% - 16px)}}
-</style></head><body><div id="app" class="app">Loading Coin Cove...</div><script>(function(){const tg=window.Telegram&&window.Telegram.WebApp;let user=null;let authMode='';const $=id=>document.getElementById(id);if(tg){try{tg.ready();tg.expand();if(tg.setHeaderColor)tg.setHeaderColor('#f4f7fb');if(tg.setBackgroundColor)tg.setBackgroundColor('#f4f7fb')}catch(e){}}function init(){return tg&&tg.initData?tg.initData:''}function emailToken(){return localStorage.getItem('cc_email_token')||''}async function req(path,opt={}){const et=emailToken();opt.headers=Object.assign({},opt.headers||{},init()?{'X-Telegram-Init-Data':init()}:(!opt.headers?.Authorization&&et?{'Authorization':'Bearer '+et}:{}));const r=await fetch(path,opt);let d;try{d=await r.json()}catch(e){d={success:false,message:'Invalid server response ('+r.status+').'}}return d}async function load(){try{const ti=init(),et=emailToken();let d;if(ti){d=await req('/api/me');authMode='telegram'}else if(et){d=await req('/api/auth/me');authMode='email'}else{showAuth();return}if(!d.success){if(authMode==='email')localStorage.removeItem('cc_email_token');showAuth();return}user=d.user;render(d)}catch(e){console.error('load:',e);showError('Unable to connect. Please try again.')}}function header(email){return '<div class="topbar"><div class="brand"><div class="brand-icon">🪙</div><span>Coin Cove</span></div><div class="pill">'+(email?'✉️ Email account':'✈️ Telegram')+'</div></div>'}function render(d){const w=d.wallet||{},u=d.user||{};const name=u.first_name||u.username||'there';const email=u.email||'';const activity=(d.transactions||[]).slice(0,8).map(function(x){return '<div class="activity-item"><span>'+esc(x.description||x.type||'Activity')+'</span><span class="positive">'+esc(x.amount)+'</span></div>'}).join('')||'<div class="empty">No activity yet.</div>';$('app').innerHTML=header(authMode==='email')+'<div class="hero"><div class="balance"><div class="welcome">Welcome back, <b>'+esc(name)+'</b></div><div class="balance-row"><div><div class="num">'+Number(w.balance||0).toLocaleString()+'</div><div class="coins-label">Coins available</div></div><div style="font-size:38px">💰</div></div></div><div class="account-card"><h3>Your account</h3><p>'+ (email?'<span class="email-line">✉️ '+esc(email)+'</span>':'Connected securely through Telegram') +'</p></div></div><div class="section-title">Earn & manage</div><div class="actions"><button class="action" onclick="offers()"><div class="action-icon">🎁</div><strong>Offers</strong><span>Complete offers and earn</span></button><button class="action" onclick="ad()" '+(authMode==='email'?'disabled':'')+'><div class="action-icon">📺</div><strong>Watch & Earn</strong><span>'+(authMode==='email'?'Telegram only':'Watch ads for Coins')+'</span></button><button class="action" onclick="ref()"><div class="action-icon">👥</div><strong>Invite</strong><span>Share your referral</span></button><button class="action" onclick="withdraw()"><div class="action-icon">💸</div><strong>Withdraw</strong><span>USDT TRC20 / Binance ID</span></button></div><div class="card"><h3>Recent activity</h3><div class="activity">'+activity+'</div></div>'+(authMode==='email'?'<div class="card"><button class="btn secondary" onclick="emailLogout()">Log out of email account</button></div>':'')+'<div class="nav"><button class="active" onclick="load()">🏠<br>Home</button><button onclick="offers()">🎁<br>Offers</button><button onclick="ref()">👥<br>Invite</button><button onclick="withdraw()">💰<br>Wallet</button></div>'}function showAuth(){authMode='email';$('app').innerHTML='<div class="auth-page"><div class="auth-wrap"><div class="auth-logo"><div class="brand"><div class="brand-icon">🪙</div><span>Coin Cove</span></div></div><div class="auth-card"><h1>Welcome to Coin Cove</h1><p class="sub">Use Coin Cove independently from Telegram. Create an account or sign in with your email and password.</p><div class="tabs"><button id="tabLogin" class="active" onclick="switchAuth(\'login\')">Login</button><button id="tabRegister" onclick="switchAuth(\'register\')">Create account</button></div><div id="authFields"></div><div id="authStatus" class="status"></div><button id="authSubmit" class="btn" onclick="submitAuth()">Login</button><div class="auth-note">No email verification is required. Your password is stored as a secure hash.</div></div></div></div>';switchAuth('login')}function switchAuth(mode){window.authTab=mode;const login=mode==='login';$('tabLogin').classList.toggle('active',login);$('tabRegister').classList.toggle('active',!login);$('authFields').innerHTML='<input id="authEmail" class="input" type="email" autocomplete="email" placeholder="Email address">'+'<input id="authPassword" class="input" type="password" autocomplete="'+(login?'current-password':'new-password')+'" placeholder="Password">'+(login?'':'<input id="authConfirm" class="input" type="password" autocomplete="new-password" placeholder="Confirm password">');$('authSubmit').textContent=login?'Login':'Create account';$('authStatus').textContent='';$('authStatus').className='status'}async function submitAuth(){const email=String($('authEmail')?.value||'').trim().toLowerCase(),password=String($('authPassword')?.value||''),confirm=String($('authConfirm')?.value||'');const status=$('authStatus'),btn=$('authSubmit');status.className='status';status.textContent='';if(!email||!email.includes('@')){status.textContent='Enter a valid email address.';return}if(password.length<8){status.textContent='Password must be at least 8 characters.';return}if(window.authTab==='register'&&password!==confirm){status.textContent='Passwords do not match.';return}btn.disabled=true;btn.textContent=window.authTab==='login'?'Signing in...':'Creating account...';try{const path=window.authTab==='login'?'/api/auth/login':'/api/auth/register';const body={email:email,password:password};if(window.authTab==='register')body.confirmPassword=confirm;const d=await req(path,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(body)});if(d.success&&d.token){localStorage.setItem('cc_email_token',d.token);status.className='status ok';status.textContent=window.authTab==='login'?'Login successful.':'Account created successfully.';user=d.user;authMode='email';setTimeout(function(){load()},180);return}status.textContent=d.message||'Authentication failed.'}catch(e){console.error(e);status.textContent='Network error. Please try again.'}finally{btn.disabled=false;btn.textContent=window.authTab==='login'?'Login':'Create account'}}window.emailLogout=async function(){try{await req('/api/auth/logout',{method:'POST'})}catch(e){}localStorage.removeItem('cc_email_token');user=null;showAuth()};window.offers=function(){if(!user)return;const uid=encodeURIComponent(String(user.telegram_id||user.id));document.body.insertAdjacentHTML('beforeend','<div id="wall" class="modal"><div class="sheet"><div class="close-row"><h3>🎁 Offers</h3><button class="close" onclick="closeWall()">Close</button></div><iframe style="width:100%;height:70vh;border:0;border-radius:16px" src="https://offerwall.gg/wall/4c826098db679c99583194371d0eae1b?userId='+uid+'"></iframe></div></div>')};window.closeWall=function(){document.getElementById('wall')?.remove()};window.ad=async function(){if(!tg||!tg.initData)return alert('Watch & Earn is available when the app is opened from Telegram.');if(typeof window.show_11766606!=='function')return alert('Ad service is not ready.');try{await window.show_11766606({ymid:String(user.telegram_id),requestVar:'watch_earn'});const d=await req('/api/reward-ad',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg.initData})});alert(d.message||'Completed');setTimeout(load,1500)}catch(e){alert('Ad was not completed.')}};window.ref=async function(){const d=await req('/api/referral');if(!d.success)return alert(d.message||'Referral unavailable');prompt('Referral link',d.link)};window.withdraw=function(){document.body.insertAdjacentHTML('beforeend','<div id="wd" class="modal"><div class="sheet"><div class="close-row"><h3>💸 Withdraw</h3><button class="close" onclick="document.getElementById(\'wd\').remove()">Close</button></div><p class="muted">Minimum: 200 Coins = $0.10. Withdrawals use 200-coin steps.</p><select id="wm" class="select"><option value="USDT_TRC20">USDT TRC20</option><option value="BINANCE_ID">BINANCE ID</option></select><input id="wc" class="input" type="number" min="200" step="200" placeholder="Coins amount"><input id="dest" class="input" placeholder="USDT TRC20 wallet address / Binance ID"><button class="btn" onclick="submitWd()">Submit withdrawal</button></div></div>')};window.submitWd=async function(){const b={method:$('wm').value,coins:Number($('wc').value),destination:$('dest').value.trim()};const d=await req('/api/withdraw',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert(d.message||(d.success?'Withdrawal submitted':'Withdrawal failed'));if(d.success){$('wd')?.remove();load()}};function showError(m){$('app').innerHTML='<div class="auth-page"><div class="auth-wrap"><div class="auth-card"><h1>Coin Cove</h1><p class="sub">'+esc(m||'Error')+'</p><button class="btn" onclick="load()">Retry</button></div></div></div>'}function esc(v){return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;')}window.switchAuth=switchAuth;window.submitAuth=submitAuth;load()})();</script></body></html>`}
+</style></head><body><div id="app" class="app">Loading Coin Cove...</div><script>(function(){const tg=window.Telegram&&window.Telegram.WebApp;let user=null;let authMode='';const $=id=>document.getElementById(id);if(tg){try{tg.ready();tg.expand();if(tg.setHeaderColor)tg.setHeaderColor('#f4f7fb');if(tg.setBackgroundColor)tg.setBackgroundColor('#f4f7fb')}catch(e){}}function init(){return tg&&tg.initData?tg.initData:''}function emailToken(){return localStorage.getItem('cc_email_token')||''}async function req(path,opt={}){const et=emailToken();opt.headers=Object.assign({},opt.headers||{},init()?{'X-Telegram-Init-Data':init()}:(!opt.headers?.Authorization&&et?{'Authorization':'Bearer '+et}:{}));const r=await fetch(path,opt);let d;try{d=await r.json()}catch(e){d={success:false,message:'Invalid server response ('+r.status+').'}}return d}async function load(){try{const ti=init(),et=emailToken();let d;if(ti){d=await req('/api/me');authMode='telegram'}else if(et){d=await req('/api/auth/me');authMode='email'}else{showAuth();return}if(!d.success){if(authMode==='email')localStorage.removeItem('cc_email_token');showAuth();return}user=d.user;render(d)}catch(e){console.error('load:',e);showError('Unable to connect. Please try again.')}}function header(email){return '<div class="topbar"><div class="brand"><div class="brand-icon">🪙</div><span>Coin Cove</span></div><div class="pill">'+(email?'✉️ Email account':'✈️ Telegram')+'</div></div>'}function render(d){const w=d.wallet||{},u=d.user||{};const name=u.first_name||u.username||'there';const email=u.email||'';const activity=(d.transactions||[]).slice(0,8).map(function(x){return '<div class="activity-item"><span>'+esc(x.description||x.type||'Activity')+'</span><span class="positive">'+esc(x.amount)+'</span></div>'}).join('')||'<div class="empty">No activity yet.</div>';$('app').innerHTML=header(authMode==='email')+'<div class="hero"><div class="balance"><div class="welcome">Welcome back, <b>'+esc(name)+'</b></div><div class="balance-row"><div><div class="num">'+Number(w.balance||0).toLocaleString()+'</div><div class="coins-label">Coins available</div></div><div style="font-size:38px">💰</div></div></div><div class="account-card"><h3>Your account</h3><p>'+ (email?'<span class="email-line">✉️ '+esc(email)+'</span>':'Connected securely through Telegram') +'</p></div></div><div class="section-title">Earn & manage</div><div class="actions"><button class="action" onclick="offers()"><div class="action-icon">🎁</div><strong>Offers</strong><span>Complete offers and earn</span></button><button class="action" onclick="ad()" '+(authMode==='email'?'disabled':'')+'><div class="action-icon">📺</div><strong>Watch & Earn</strong><span>'+(authMode==='email'?'Telegram only':'Watch ads for Coins')+'</span></button><button class="action" onclick="ref()"><div class="action-icon">👥</div><strong>Invite</strong><span>Share your referral</span></button><button class="action" onclick="withdraw()"><div class="action-icon">💸</div><strong>Withdraw</strong><span>USDT TRC20 / Binance ID</span></button></div><div class="card"><h3>Recent activity</h3><div class="activity">'+activity+'</div></div>'+(authMode==='email'?'<div class="card"><button class="btn secondary" onclick="emailLogout()">Log out of email account</button></div>':'')+'<div class="nav"><button class="active" onclick="load()">🏠<br>Home</button><button onclick="offers()">🎁<br>Offers</button><button onclick="ref()">👥<br>Invite</button><button onclick="withdraw()">💰<br>Wallet</button></div>'}function showAuth(){authMode='email';$('app').innerHTML='<div class="auth-page"><div class="auth-wrap"><div class="auth-logo"><div class="brand"><div class="brand-icon">🪙</div><span>Coin Cove</span></div></div><div class="auth-card"><h1>Welcome to Coin Cove</h1><p class="sub">Use Coin Cove independently from Telegram. Create an account or sign in with your email and password.</p><div class="tabs"><button id="tabLogin" class="active" onclick="switchAuth(\'login\')">Login</button><button id="tabRegister" onclick="switchAuth(\'register\')">Create account</button></div><div id="authFields"></div><div id="authStatus" class="status"></div><button id="authSubmit" class="btn" onclick="submitAuth()">Login</button><div class="auth-note">No email verification is required. Your password is stored as a secure hash.</div></div></div></div>';switchAuth('login')}function switchAuth(mode){window.authTab=mode;const login=mode==='login';$('tabLogin').classList.toggle('active',login);$('tabRegister').classList.toggle('active',!login);$('authFields').innerHTML='<input id="authEmail" class="input" type="email" autocomplete="email" placeholder="Email address">'+'<input id="authPassword" class="input" type="password" autocomplete="'+(login?'current-password':'new-password')+'" placeholder="Password">'+(login?'':'<input id="authConfirm" class="input" type="password" autocomplete="new-password" placeholder="Confirm password">');$('authSubmit').textContent=login?'Login':'Create account';$('authStatus').textContent='';$('authStatus').className='status'}async function submitAuth(){const email=String($('authEmail')?.value||'').trim().toLowerCase(),password=String($('authPassword')?.value||''),confirm=String($('authConfirm')?.value||'');const status=$('authStatus'),btn=$('authSubmit');status.className='status';status.textContent='';if(!email||!email.includes('@')){status.textContent='Enter a valid email address.';return}if(password.length<8){status.textContent='Password must be at least 8 characters.';return}if(window.authTab==='register'&&password!==confirm){status.textContent='Passwords do not match.';return}btn.disabled=true;btn.textContent=window.authTab==='login'?'Signing in...':'Creating account...';try{const path=window.authTab==='login'?'/api/auth/login':'/api/auth/register';const body={email:email,password:password};if(window.authTab==='register')body.confirmPassword=confirm;const d=await req(path,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(body)});if(d.success&&d.token){localStorage.setItem('cc_email_token',d.token);status.className='status ok';status.textContent=window.authTab==='login'?'Login successful.':'Account created successfully.';user=d.user;authMode='email';setTimeout(function(){load()},180);return}status.textContent=d.message||'Authentication failed.'}catch(e){console.error(e);status.textContent='Network error. Please try again.'}finally{btn.disabled=false;btn.textContent=window.authTab==='login'?'Login':'Create account'}}window.emailLogout=async function(){try{await req('/api/auth/logout',{method:'POST'})}catch(e){}localStorage.removeItem('cc_email_token');user=null;showAuth()};window.offers=function(){
+  if(!user)return;
+
+  /*
+   * IMPORTANT:
+   * Coin Cove always uses the internal database user ID.
+   * For email accounts this is users.id.
+   * For Telegram accounts this is also users.id.
+   */
+  const uid=encodeURIComponent(String(user.id));
+
+  document.body.insertAdjacentHTML(
+    'beforeend',
+    '<div id="wall" class="modal">'+
+      '<div class="sheet">'+
+        '<div class="close-row">'+
+          '<h3>🎁 Offers</h3>'+
+          '<button class="close" onclick="closeWall()">Close</button>'+
+        '</div>'+
+
+        '<div style="display:grid;gap:12px">'+
+
+          '<button class="action" style="width:100%" onclick="openProvider(\'cpidroid\')">'+
+            '<div class="action-icon">🎯</div>'+
+            '<strong>CPIDroid</strong>'+
+            '<span>Complete offers and earn Coins</span>'+
+          '</button>'+
+
+          '<button class="action" style="width:100%" onclick="openProvider(\'notik\')">'+
+            '<div class="action-icon">🎮</div>'+
+            '<strong>Notik</strong>'+
+            '<span>Games, tasks and offers</span>'+
+          '</button>'+
+
+          '<button class="action" style="width:100%" onclick="openProvider(\'admantum\')">'+
+            '<div class="action-icon">💎</div>'+
+            '<strong>AdMantum</strong>'+
+            '<span>Complete offers and earn Coins</span>'+
+          '</button>'+
+
+          '<button class="action" style="width:100%" onclick="openProvider(\'offerwallgg\')">'+
+            '<div class="action-icon">🎁</div>'+
+            '<strong>Offerwall.GG</strong>'+
+            '<span>Complete offers and earn Coins</span>'+
+          '</button>'+
+
+        '</div>'+
+
+        '<div id="providerWall" style="margin-top:16px"></div>'+
+      '</div>'+
+    '</div>'
+  );
+
+  window.openProvider=function(provider){
+
+    const box=document.getElementById('providerWall');
+
+    if(!box)return;
+
+    let src='';
+
+    if(provider==='cpidroid'){
+      src='https://wall.cpidroid.com/offer/yxpm-81812-kal5?uid='+uid+'&gaid=&idfa=';
+    }
+
+    if(provider==='notik'){
+      src='https://notik.me/coins?api_key=2eZo0UC1kNfCwjcFCYGpEWGwSDWzXJo9&pub_id=sLzA&app_id=fggvW50o8Z&user_id='+uid;
+    }
+
+    if(provider==='admantum'){
+      src='https://www.admantum.com/offers?appid=27938&uid='+uid;
+    }
+
+    if(provider==='offerwallgg'){
+      src='https://offerwall.gg/wall/4c826098db679c99583194371d0eae1b?userId='+uid;
+    }
+
+    if(!src)return;
+
+    box.innerHTML=
+      '<div class="card" style="padding:10px">'+
+        '<div class="close-row">'+
+          '<strong>'+esc(provider)+'</strong>'+
+          '<button class="close" onclick="document.getElementById(\'providerWall\').innerHTML=\'\'">Back</button>'+
+        '</div>'+
+        '<iframe '+
+          'src="'+src+'" '+
+          'style="width:100%;height:65vh;border:0;border-radius:16px;background:#fff" '+
+          'allow="clipboard-write" '+
+        '></iframe>'+
+      '</div>';
+  };
+};window.closeWall=function(){document.getElementById('wall')?.remove()};window.ad=async function(){if(!tg||!tg.initData)return alert('Watch & Earn is available when the app is opened from Telegram.');if(typeof window.show_11766606!=='function')return alert('Ad service is not ready.');try{await window.show_11766606({ymid:String(user.telegram_id),requestVar:'watch_earn'});const d=await req('/api/reward-ad',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg.initData})});alert(d.message||'Completed');setTimeout(load,1500)}catch(e){alert('Ad was not completed.')}};window.ref=async function(){const d=await req('/api/referral');if(!d.success)return alert(d.message||'Referral unavailable');prompt('Referral link',d.link)};window.withdraw=function(){document.body.insertAdjacentHTML('beforeend','<div id="wd" class="modal"><div class="sheet"><div class="close-row"><h3>💸 Withdraw</h3><button class="close" onclick="document.getElementById(\'wd\').remove()">Close</button></div><p class="muted">Minimum: 200 Coins = $0.10. Withdrawals use 200-coin steps.</p><select id="wm" class="select"><option value="USDT_TRC20">USDT TRC20</option><option value="BINANCE_ID">BINANCE ID</option></select><input id="wc" class="input" type="number" min="200" step="200" placeholder="Coins amount"><input id="dest" class="input" placeholder="USDT TRC20 wallet address / Binance ID"><button class="btn" onclick="submitWd()">Submit withdrawal</button></div></div>')};window.submitWd=async function(){const b={method:$('wm').value,coins:Number($('wc').value),destination:$('dest').value.trim()};const d=await req('/api/withdraw',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert(d.message||(d.success?'Withdrawal submitted':'Withdrawal failed'));if(d.success){$('wd')?.remove();load()}};function showError(m){$('app').innerHTML='<div class="auth-page"><div class="auth-wrap"><div class="auth-card"><h1>Coin Cove</h1><p class="sub">'+esc(m||'Error')+'</p><button class="btn" onclick="load()">Retry</button></div></div></div>'}function esc(v){return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;')}window.switchAuth=switchAuth;window.submitAuth=submitAuth;load()})();</script></body></html>`}
 
 function renderAdmin(){return String.raw`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Cove Admin</title><style>body{font-family:Arial;margin:0;background:#f4f6f9;color:#111827}.wrap{max-width:1000px;margin:auto;padding:20px}.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;overflow:auto}.input,.btn{padding:12px;border-radius:10px;border:1px solid #ddd}.btn{background:#111827;color:#fff;border:0;font-weight:700}table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}</style></head><body><div class="wrap"><div id="app">Loading...</div></div><script>let token=localStorage.getItem('cc_admin_token')||'';const esc=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');async function api(p,o={}){o.headers=Object.assign({'Content-Type':'application/json'},o.headers||{},token?{'Authorization':'Bearer '+token}:{});return fetch(p,o).then(r=>r.json())}async function boot(){const m=await api('/api/admin/me');if(!m.success){login();return}dash()}function login(){document.getElementById('app').innerHTML='<div class="card"><h2>Coin Cove Admin</h2><input id="u" class="input" placeholder="Admin Username"><input id="p" class="input" type="password" placeholder="Admin Password"><button class="btn" onclick="doLogin()">Login</button></div>'}async function doLogin(){const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username:u.value,password:p.value})});if(!d.success)return alert(d.message);token=d.token;localStorage.setItem('cc_admin_token',token);dash()}async function dash(){const [us,ws]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals')]);document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Users</h3><table><tr><th>ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(x.usd_cents/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\'approve\')">Approve</button> <button class="btn" onclick="act('+x.id+',\'reject\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}async function act(id,a){const d=await api('/api/admin/withdrawal',{method:'POST',body:JSON.stringify({id,action:a})});alert(d.message||'Done');dash()}async function logout(){await api('/api/admin/logout',{method:'POST'});localStorage.removeItem('cc_admin_token');token='';login()}boot()</script></body></html>`}
