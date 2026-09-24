@@ -1242,9 +1242,18 @@ button,input,select{font:inherit}button{cursor:pointer}.wrap{max-width:720px;mar
 </style>
 </head>
 <body>
-<div id="app"><div class="wrap"><div class="card">Loading Coin Cove...</div></div></div>
+<div id="app"><div class="wrap"><div class="card" style="margin-top:8vh">
+<div class="brand">🌊 Coin Cove</div>
+<p class="muted">Sign in to earn Coins and request withdrawals.</p>
+<div class="actions">
+<input id="le" class="input" type="email" placeholder="Email" autocomplete="email">
+<input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password">
+<button class="btn" onclick="doLogin()">Login</button>
+<button class="btn secondary" onclick="showRegister()">Create account</button>
+</div>
+<p class="small" style="margin-top:14px">Coin Cove is starting…</p>
+</div></div></div>
 <script>
-try{document.getElementById('app').innerHTML='<div class=\"wrap\"><div class=\"card\">Starting Coin Cove...</div></div>'}catch(e){}
 const TAPJOY_SDK_KEY=${JSON.stringify(TAPJOY_SDK_KEY)};
 const TAPJOY_PLACEMENT=${JSON.stringify(TAPJOY_PLACEMENT)};
 const tg=window.Telegram&&window.Telegram.WebApp;
