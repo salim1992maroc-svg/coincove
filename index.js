@@ -1,5 +1,5 @@
 const APP_NAME = "Coin Cove";
-const BUILD_VERSION = "2026-09-24-auth-fix-v6";
+const BUILD_VERSION = "2026-09-25-offerwalls-v8";
 const TAPJOY_SDK_KEY = "277Mt0yeQyuT_sZLoCUE_gEC0KXJGsauFETqGFqtLDz4ZQ0B_sGMBmpWRx1y";
 const TAPJOY_PLACEMENT = "coincover";
 const POINTS_NAME = "Coins";
@@ -10,6 +10,16 @@ const MINI_APP_SHORT_NAME = "myapp";
 const WITHDRAW_MIN_COINS = 200;
 const COINS_PER_USD = 2000;
 const MONETAG_ZONE_ID = "11766606";
+
+// Offerwall configuration supplied for Coin Cove. Secrets are used only on the server side.
+const ADMANTUM_APP_ID = "27938";
+const ADMANTUM_SECRET_KEY = "adme973b8e";
+const NOTIK_API_KEY = "2eZo0UC1kNfCwjcFCYGpEWGwSDWzXJo9";
+const NOTIK_PUB_ID = "sLzA";
+const NOTIK_APP_ID = "fggvW50o8Z";
+const NOTIK_SECRET_KEY = "h6n79wyyoYgJuiNEqFwfzt5bLGhsgbGn";
+const CPIDROID_PLACEMENT = "yxpm-81812-kal5";
+const OFFERWALL_GG_PUBLIC_KEY = "4c826098db679c99583194371d0eae1b";
 
 export default {
   async fetch(request, env) {
@@ -72,63 +82,138 @@ export default {
   }
 };
 
+async function readPostbackParams(request) {
+  const u = new URL(request.url);
+  const data = new URLSearchParams(u.search);
+  if (request.method === "POST") {
+    const ct = (request.headers.get("content-type") || "").toLowerCase();
+    try {
+      if (ct.includes("application/x-www-form-urlencoded")) {
+        const body = await request.text();
+        const b = new URLSearchParams(body);
+        for (const [k,v] of b) data.set(k,v);
+      } else if (ct.includes("application/json")) {
+        const b = await request.json();
+        for (const [k,v] of Object.entries(b || {})) data.set(k, String(v ?? ""));
+      }
+    } catch {}
+  }
+  return data;
+}
+
 async function cpidroidPostback(request, env) {
-  if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+  if (!["GET","POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
   return processProviderPostback(request, env, "cpidroid", {
-    userParam: "user_id",
-    transactionParam: "txn_id",
-    amountParam: "payout_vc",
-    offerIdParam: "offer_id",
-    offerNameParam: "offer_name",
-    payoutUsdParam: "payout_usd"
+    params: await readPostbackParams(request),
+    userAliases: ["uid", "user_id", "userid"],
+    transactionAliases: ["trans_id", "txn_id", "transaction_id", "txid"],
+    amountAliases: ["amount", "payout_vc", "virtual_currency", "reward", "coins"],
+    offerIdAliases: ["offer_id", "of_id"],
+    offerNameAliases: ["offer_name", "of_name"],
+    payoutUsdAliases: ["payout_usd", "payout"]
   });
 }
 
 async function notikPostback(request, env) {
-  if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
-  const q = new URL(request.url).searchParams;
-  const userId = (q.get("user_id") || q.get("userid") || q.get("uid") || "").trim();
-  const transactionId = (q.get("txn_id") || q.get("transaction_id") || q.get("trans_id") || q.get("txid") || "").trim();
-  const rawAmount = q.get("virtual_currency") ?? q.get("payout_vc") ?? q.get("amount") ?? q.get("reward") ?? q.get("coins");
-  if (!userId || !transactionId || rawAmount === null) return new Response("bad request", { status: 400 });
-
+  if (!["GET","POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
+  const params = await readPostbackParams(request);
   return processProviderPostback(request, env, "notik", {
-    suppliedUserId: userId,
-    suppliedTransactionId: transactionId,
-    suppliedAmount: rawAmount,
-    userParam: "user_id",
-    transactionParam: "txn_id",
-    amountParam: "virtual_currency",
-    offerIdParam: "offer_id",
-    offerNameParam: "offer_name",
-    payoutUsdParam: "payout_usd"
+    params,
+    requiredSecret: NOTIK_SECRET_KEY,
+    userAliases: ["user_id", "userid", "uid", "subid"],
+    transactionAliases: ["txn_id", "transaction_id", "trans_id", "txid", "transaction"],
+    amountAliases: ["virtual_currency", "payout_vc", "amount", "reward", "coins"],
+    offerIdAliases: ["offer_id", "of_id"],
+    offerNameAliases: ["offer_name", "of_name"],
+    payoutUsdAliases: ["payout_usd", "payout"]
   });
 }
 
 async function admantumPostback(request, env) {
-  if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
-  return processProviderPostback(request, env, "admantum", {
-    userParam: "userid",
-    transactionParam: "trans_id",
-    amountParam: "amount",
-    offerIdParam: "trans_id",
-    offerNameParam: "placement",
-    payoutUsdParam: "payout_usd"
-  });
+  if (!["GET","POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
+  const q = await readPostbackParams(request);
+  if (!env.DB) return new Response("server configuration error", { status: 500 });
+  await ensureSchema(env);
+
+  const uid = (q.get("uid") || q.get("user_id") || q.get("userid") || "").trim();
+  const ofId = (q.get("of_id") || q.get("offer_id") || "").trim();
+  const rawAmount = q.get("virtual_currency") ?? q.get("amount") ?? q.get("payout");
+  const status = (q.get("status") || "1").trim();
+  const tx = (q.get("transaction_id") || q.get("trans_id") || q.get("txn_id") || "").trim();
+  const hash = (q.get("hash") || "").trim().toLowerCase();
+  if (!uid || rawAmount === null || !tx) return new Response("bad request", { status: 400 });
+
+  const expectedHash = md5Hex(uid + ofId + String(rawAmount) + ADMANTUM_SECRET_KEY).toLowerCase();
+  if (!hash || !constantTimeEqual(hash, expectedHash)) return new Response("invalid hash", { status: 403 });
+
+  const user = await dbUserByDatabaseId(env.DB, uid);
+  if (!user) return new Response("unknown user", { status: 404 });
+  let amount = Number(rawAmount);
+  if (!Number.isFinite(amount)) return new Response("invalid amount", { status: 400 });
+  amount = Math.trunc(amount);
+  if (status === "0" || status.toLowerCase() === "reversed") amount = -Math.abs(amount);
+  if (amount === 0) return new Response("ok", { status: 200 });
+
+  const now = Math.floor(Date.now() / 1000);
+  const transactionId = "admantum:" + tx;
+  const offerName = q.get("of_name") || q.get("offer_name") || "AdMantum offer";
+  const payoutUsd = Number(q.get("payout") || q.get("payout_usd") || 0);
+
+  if (amount > 0) {
+    try {
+      await env.DB.batch([
+        env.DB.prepare(`INSERT INTO offerwall_conversions
+          (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?)`)
+          .bind(transactionId, user.id, amount, "credited", ofId || null, offerName, q.get("event_id") || null, Number.isFinite(payoutUsd) ? payoutUsd : 0, 0, now),
+        env.DB.prepare(`UPDATE wallets SET balance=balance+?,lifetime_earned=lifetime_earned+?,updated_at=? WHERE user_id=?`)
+          .bind(amount, amount, now, user.id),
+        env.DB.prepare(`INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)`)
+          .bind(user.id, "admantum_offer_reward", amount, "AdMantum offer reward", now)
+      ]);
+    } catch (e) {
+      const m = String(e?.message || e).toLowerCase();
+      if (m.includes("unique") || m.includes("constraint")) return new Response("ok", { status: 200 });
+      console.error("AdMantum credit error:", e);
+      return new Response("server error", { status: 500 });
+    }
+    return new Response("OK", { status: 200 });
+  }
+
+  // AdMantum uses a new transaction id for reversals, so locate the latest matching credited conversion.
+  const original = await env.DB.prepare(`SELECT transaction_id,amount,status FROM offerwall_conversions
+    WHERE user_id=? AND status='credited' AND (?='' OR offer_id=?) ORDER BY id DESC LIMIT 1`)
+    .bind(user.id, ofId, ofId).first();
+  if (!original) return new Response("OK", { status: 200 });
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare("UPDATE offerwall_conversions SET status='reversed' WHERE transaction_id=?").bind(original.transaction_id),
+      env.DB.prepare(`UPDATE wallets SET balance=MAX(0,balance-?),updated_at=? WHERE user_id=?`).bind(Math.abs(Number(original.amount)), now, user.id),
+      env.DB.prepare(`INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)`)
+        .bind(user.id, "admantum_offer_reversal", -Math.abs(Number(original.amount)), "AdMantum offer reversal", now)
+    ]);
+  } catch (e) {
+    console.error("AdMantum reversal error:", e);
+    return new Response("server error", { status: 500 });
+  }
+  return new Response("OK", { status: 200 });
 }
 
 async function processProviderPostback(request, env, provider, config) {
-  if (!env.DB || !env.OFFERWALL_SECRET) return new Response("server configuration error", { status: 500 });
+  if (!env.DB) return new Response("server configuration error", { status: 500 });
   await ensureSchema(env);
 
-  const q = new URL(request.url).searchParams;
-  const receivedSecret = (q.get("secret") || "").trim();
-  if (!receivedSecret) return new Response("missing secret", { status: 403 });
-  if (!constantTimeEqual(receivedSecret, String(env.OFFERWALL_SECRET))) return new Response("invalid secret", { status: 403 });
+  const q = config.params || await readPostbackParams(request);
+  if (config.requiredSecret) {
+    const receivedSecret = (q.get("secret") || q.get("secret_key") || q.get("api_secret") || "").trim();
+    if (!receivedSecret || !constantTimeEqual(receivedSecret, String(config.requiredSecret))) return new Response("invalid secret", { status: 403 });
+  }
 
-  const userId = String(config.suppliedUserId ?? q.get(config.userParam) ?? "").trim();
-  const transactionId = String(config.suppliedTransactionId ?? q.get(config.transactionParam) ?? "").trim();
-  const rawAmount = config.suppliedAmount ?? q.get(config.amountParam);
+  const first = (aliases) => { for (const k of aliases || []) { const v=q.get(k); if (v !== null && String(v).trim() !== "") return String(v).trim(); } return ""; };
+  const userId = first(config.userAliases);
+  const transactionId = first(config.transactionAliases);
+  const rawAmount = first(config.amountAliases);
   if (!userId || !transactionId || rawAmount === null || rawAmount === undefined) return new Response("bad request", { status: 400 });
 
   const user = await dbUserByDatabaseId(env.DB, userId);
@@ -141,9 +226,9 @@ async function processProviderPostback(request, env, provider, config) {
 
   const providerTransactionId = provider + ":" + transactionId;
   const now = Math.floor(Date.now() / 1000);
-  const offerId = q.get(config.offerIdParam || "") || q.get("offer_id") || null;
-  const offerName = q.get(config.offerNameParam || "") || q.get("offer_name") || q.get("of_name") || null;
-  const payoutUsdRaw = q.get(config.payoutUsdParam || "") || q.get("payout_usd") || q.get("payoutUsd") || "0";
+  const offerId = first(config.offerIdAliases) || null;
+  const offerName = first(config.offerNameAliases) || null;
+  const payoutUsdRaw = first(config.payoutUsdAliases) || "0";
   const payoutUsd = Number(payoutUsdRaw);
   const safePayoutUsd = Number.isFinite(payoutUsd) && payoutUsd >= 0 ? payoutUsd : 0;
 
@@ -580,27 +665,33 @@ async function monetagPostback(request, env) {
 }
 
 async function offerwallPostback(request, env) {
-  if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
-  if (!env.DB || !env.OFFERWALL_SECRET) return new Response("server configuration error", { status: 500 });
+  if (request.method !== "GET" && request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  const secret = env.OFFERWALL_GG_SECRET || env.OFFERWALL_SECRET;
+  if (!env.DB || !secret) return new Response("server configuration error", { status: 500 });
   await ensureSchema(env);
 
-  const q = new URL(request.url).searchParams;
-  const userId = (q.get("user") || "").trim();
-  const tx = (q.get("tx") || "").trim();
-  const raw = q.get("amount");
-  const sig = (q.get("sig") || "").trim();
+  const q = await readPostbackParams(request);
+  const userId = (q.get("user") || q.get("userId") || q.get("user_id") || "").trim();
+  const tx = (q.get("tx") || q.get("transactionId") || q.get("txid") || q.get("trans_id") || "").trim();
+  const raw = q.get("amount") ?? q.get("currencyAmount") ?? q.get("points") ?? q.get("reward");
+  const sig = (q.get("sig") || q.get("signature") || q.get("hash") || "").trim();
   const status = (q.get("status") || "").trim().toLowerCase();
   const test = q.get("test") || "0";
 
   if (!userId || !tx || raw === null || !sig) return new Response("bad request", { status: 400 });
 
-  const expected = await hmacHexText(env.OFFERWALL_SECRET, `${userId}:${tx}:${raw}`);
+  const expected = await hmacHexText(secret, `${userId}:${tx}:${raw}`);
   if (!constantTimeEqual(expected, sig)) return new Response("invalid signature", { status: 403 });
   if (test === "1") return new Response("ok", { status: 200 });
   if (status !== "credited" && status !== "reversed") return new Response("ok", { status: 200 });
 
-  const amount = Number(raw);
-  if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount === 0) return new Response("ok", { status: 200 });
+  const amountRaw = Number(raw);
+  if (!Number.isFinite(amountRaw) || amountRaw === 0) return new Response("ok", { status: 200 });
+  // Coin Cove stores Coins as whole units. Offerwall.GG may send fractional
+  // currency amounts, so truncate once on credit and use the stored amount
+  // for the matching reversal to keep the ledger symmetric.
+  const amount = amountRaw < 0 ? Math.ceil(amountRaw) : Math.floor(amountRaw);
+  if (!amount) return new Response("ok", { status: 200 });
 
   const u = await dbUserByDatabaseId(env.DB, userId);
   if (!u) return new Response("unknown user", { status: 404 });
@@ -613,7 +704,7 @@ async function offerwallPostback(request, env) {
           INSERT INTO offerwall_conversions
           (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
           VALUES(?,?,?,?,?,?,?,?,?,?)
-        `).bind(tx, u.id, amount, status, q.get("offerId"), q.get("offerName"), q.get("goalId"), Number(q.get("payoutUsd") || 0), 0, now),
+        `).bind(tx, u.id, amount, status, q.get("offerId") || q.get("offer_id"), q.get("offerName") || q.get("offer_name"), q.get("goalId") || q.get("goal_id"), Number(q.get("payoutUsd") || q.get("payout_usd") || 0), test === "1" ? 1 : 0, now),
         env.DB.prepare(`
           UPDATE wallets SET balance=balance+?,lifetime_earned=lifetime_earned+?,updated_at=? WHERE user_id=?
         `).bind(amount, amount, now, u.id),
@@ -1392,14 +1483,20 @@ function offersPage(){
  '<button class="offer" onclick="openProvider(\'cpidroid\')"><strong>🎯 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'notik\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'admantum\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'offerwallgg\')"><strong>🎁 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'offerwallgg\')"><strong>💎 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
  '</div></div>';
 }
 function openOffers(){page='offers';render()}
 function openProvider(name){
- const urls={};
- if(!urls[name]){alert('This provider URL is not configured in this build. Tapjoy is ready.');return}
- window.open(urls[name],'_blank');
+ const uid=encodeURIComponent(String(state.user?.id||''));
+ const urls={
+  cpidroid:'https://wall.cpidroid.com/offer/yxpm-81812-kal5?uid='+uid+'&gaid=&idfa=',
+  notik:'https://notik.me/coins?api_key=2eZo0UC1kNfCwjcFCYGpEWGwSDWzXJo9&pub_id=sLzA&app_id=fggvW50o8Z&user_id='+uid,
+  admantum:'https://www.admantum.com/offers?appid=27938&uid='+uid,
+  offerwallgg:'https://offerwall.gg/wall/4c826098db679c99583194371d0eae1b?userId='+uid
+ };
+ if(!urls[name]){alert('This provider is not configured yet.');return}
+ window.open(urls[name],'_blank','noopener,noreferrer');
 }
 function withdrawPage(balance){
  return '<div class="card"><h2>Withdraw</h2><div class="small">Available: '+balance.toLocaleString()+' Coins ≈ $'+money()+'</div></div>'+
