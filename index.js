@@ -230,24 +230,6 @@ async function adswedPostback(request, env) {
 
   // AdswedMedia documents: MD5(subId + transId + reward + SECRET_KEY).
   const expected = md5Hex(subId + transId + String(rawReward) + String(env.ADSWED_SECRET_KEY)).toLowerCase();
-const secret = env.ADSWED_SECRET_KEY;
-
-console.log("ADSWED_DIAGNOSTIC", {
-  secretConfigured:
-    typeof secret === "string" && secret.length > 0,
-
-  secretLength:
-    typeof secret === "string" ? secret.length : 0,
-
-  md5SelfTest:
-    md5Hex("abc") ===
-    "900150983cd24fb0d6963f7d28e17f72",
-
-  signatureLength: signature.length,
-
-  signatureMatches: constantTimeEqual(signature, expected)
-});
-
 if (!constantTimeEqual(signature, expected)) {
   return new Response("invalid signature", { status: 403 });
 }
@@ -1374,55 +1356,41 @@ async function sha256Hex(message) {
 /* WebCrypto in Cloudflare Workers does not provide MD5, but Tapjoy's
    legacy self-managed-currency callback requires MD5(id:snuid:currency:secret). */
 function md5Hex(input) {
-  function cmn(q,a,b,x,s,t){a=(a+q+x+t)|0;return (((a<<s)|(a>>>(32-s)))+b)|0;}
-  function ff(a,b,c,d,x,s,t){return cmn((b&c)|((~b)&d),a,b,x,s,t);}
-  function gg(a,b,c,d,x,s,t){return cmn((b&d)|(c&(~d)),a,b,x,s,t);}
-  function hh(a,b,c,d,x,s,t){return cmn(b^c^d,a,b,x,s,t);}
-  function ii(a,b,c,d,x,s,t){return cmn(c^(b|(~d)),a,b,x,s,t);}
+  const bytes = new TextEncoder().encode(String(input));
+  const bitLength = bytes.length * 8;
+  const paddedLength = (((bytes.length + 8) >>> 6) + 1) * 64;
+  const data = new Uint8Array(paddedLength);
+  data.set(bytes);
+  data[bytes.length] = 0x80;
+  const view = new DataView(data.buffer);
+  view.setUint32(paddedLength - 8, bitLength >>> 0, true);
+  view.setUint32(paddedLength - 4, Math.floor(bitLength / 0x100000000), true);
 
-  const bytes = new TextEncoder().encode(input);
-  const len = bytes.length;
-  const n = (((len + 8) >>> 6) + 1) * 16;
-  const x = new Array(n).fill(0);
-
-  for (let i=0;i<len;i++) x[i>>2] |= bytes[i] << ((i%4)*8);
-  x[len>>2] |= 0x80 << ((len%4)*8);
-  x[n-2] = (len * 8) >>> 0;
-  x[n-1] = Math.floor(len / 0x20000000);
-
-  let a=0x67452301,b=0xefcdab89,c=0x98badcfe,d=0x10325476;
-
-  for (let i=0;i<n;i+=16) {
-    const oa=a,ob=b,oc=c,od=d;
-    a=ff(a,b,c,d,x[i+0],7,-680876936); d=ff(d,a,b,c,x[i+1],12,-389564586); c=ff(c,d,a,b,x[i+2],17,606105819); b=ff(b,c,d,a,x[i+3],22,-1044525330);
-    a=ff(a,b,c,d,x[i+4],7,-176418897); d=ff(d,a,b,c,x[i+5],12,1200080426); c=ff(c,d,a,b,x[i+6],17,-1473231341); b=ff(b,c,d,a,x[i+7],22,-45705983);
-    a=ff(a,b,c,d,x[i+8],7,1770035416); d=ff(d,a,b,c,x[i+9],12,-1958414417); c=ff(c,d,a,b,x[i+10],17,-42063); b=ff(b,c,d,a,x[i+11],22,-1990404162);
-    a=ff(a,b,c,d,x[i+12],7,1804603682); d=ff(d,a,b,c,x[i+13],12,-40341101); c=ff(c,d,a,b,x[i+14],17,-1502002290); b=ff(b,c,d,a,x[i+15],22,1236535329);
-
-    a=gg(a,b,c,d,x[i+1],5,-165796510); d=gg(d,a,b,c,x[i+6],9,-1069501632); c=gg(c,d,a,b,x[i+11],14,643717713); b=gg(b,c,d,a,x[i+0],20,-373897302);
-    a=gg(a,b,c,d,x[i+5],5,-701558691); d=gg(d,a,b,c,x[i+10],9,38016083); c=gg(c,d,a,b,x[i+15],14,-660478335); b=gg(b,c,d,a,x[i+4],20,-405537848);
-    a=gg(a,b,c,d,x[i+9],5,568446438); d=gg(d,a,b,c,x[i+14],9,-1019803690); c=gg(c,d,a,b,x[i+3],14,-187363961); b=gg(b,c,d,a,x[i+8],20,1163531501);
-    a=gg(a,b,c,d,x[i+13],5,-1444681467); d=gg(d,a,b,c,x[i+2],9,-51403784); c=gg(c,d,a,b,x[i+7],14,1735328473); b=gg(b,c,d,a,x[i+12],20,-1926607734);
-
-    a=hh(a,b,c,d,x[i+5],4,-378558); d=hh(d,a,b,c,x[i+8],11,-2022574463); c=hh(c,d,a,b,x[i+11],16,1839030562); b=hh(b,c,d,a,x[i+14],23,-35309556);
-    a=hh(a,b,c,d,x[i+1],4,-1530992060); d=hh(d,a,b,c,x[i+4],11,1272893353); c=hh(c,d,a,b,x[i+7],16,-155497632); b=hh(b,c,d,a,x[i+10],23,-1094730640);
-    a=hh(a,b,c,d,x[i+13],4,681279174); d=hh(d,a,b,c,x[i+0],11,-358537222); c=hh(c,d,a,b,x[i+3],16,-722521979); b=hh(b,c,d,a,x[i+6],23,76029189);
-    a=hh(a,b,c,d,x[i+9],4,-640364487); d=hh(d,a,b,c,x[i+12],11,-421815835); c=hh(c,d,a,b,x[i+15],16,530742520); b=hh(b,c,d,a,x[i+2],23,-995338651);
-
-    a=ii(a,b,c,d,x[i+0],6,-198630844); d=ii(d,a,b,c,x[i+7],10,1126891415); c=ii(c,d,a,b,x[i+14],15,-1416354905); b=ii(b,c,d,a,x[i+5],21,-57434055);
-    a=ii(a,b,c,d,x[i+12],6,1700485571); d=ii(d,a,b,c,x[i+3],10,-189414153); c=ii(c,d,a,b,x[i+10],15,-1051523); b=ii(b,c,d,a,x[i+1],21,-2054922799);
-    a=ii(a,b,c,d,x[i+8],6,1873313359); d=ii(d,a,b,c,x[i+15],10,-30611744); c=ii(c,d,a,b,x[i+6],15,-1560198380); b=ii(b,c,d,a,x[i+13],21,1309151649);
-    a=ii(a,b,c,d,x[i+4],6,-145523070); d=ii(d,a,b,c,x[i+11],10,-1120210379); c=ii(c,d,a,b,x[i+2],15,718787259); b=ii(b,c,d,a,x[i+9],21,-343485551);
-
-    a=(a+oa)|0; b=(b+ob)|0; c=(c+oc)|0; d=(d+od)|0;
+  const shifts = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+    5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+  const K = Array.from({length:64}, (_,i) => Math.floor(Math.abs(Math.sin(i+1))*0x100000000) | 0);
+  let A=0x67452301, B=0xefcdab89|0, C=0x98badcfe|0, D=0x10325476;
+  for (let offset=0; offset<paddedLength; offset+=64) {
+    const M = new Int32Array(16);
+    for(let j=0;j<16;j++) M[j]=view.getInt32(offset+j*4,true);
+    let a=A,b=B,c=C,d=D;
+    for(let i=0;i<64;i++) {
+      let f,g;
+      if(i<16){ f=(b&c)|(~b&d); g=i; }
+      else if(i<32){ f=(d&b)|(~d&c); g=(5*i+1)%16; }
+      else if(i<48){ f=b^c^d; g=(3*i+5)%16; }
+      else { f=c^(b|~d); g=(7*i)%16; }
+      const sum=(a+f+K[i]+M[g])|0;
+      const rot=((sum<<shifts[i])|(sum>>>(32-shifts[i])))|0;
+      const next=(b+rot)|0;
+      a=d; d=c; c=b; b=next;
+    }
+    A=(A+a)|0; B=(B+b)|0; C=(C+c)|0; D=(D+d)|0;
   }
-
-  function hex(v) {
-    let s="";
-    for(let i=0;i<4;i++) s += ((v >>> (i*8)) & 255).toString(16).padStart(2,"0");
-    return s;
-  }
-  return hex(a)+hex(b)+hex(c)+hex(d);
+  const wordHex = n => [0,8,16,24].map(k=>((n>>>k)&255).toString(16).padStart(2,'0')).join('');
+  return wordHex(A)+wordHex(B)+wordHex(C)+wordHex(D);
 }
 
 async function hashPassword(password) {
