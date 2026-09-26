@@ -73,7 +73,7 @@ export default {
       // AdswedMedia may be configured with the Worker root URL. Only treat the root as
       // a postback when the expected AdswedMedia parameters are present; normal visitors
       // without those parameters still receive the Coin Cove app.
-      if (url.pathname === "/" && ["subId", "transId", "reward"].every(k => url.searchParams.has(k)) && (url.searchParams.has("signature") || (url.searchParams.get("type") || "").toLowerCase() === "test")) {
+      if (url.pathname === "/" && ["subId", "transId", "reward", "signature"].every(k => url.searchParams.has(k))) {
         return adswedPostback(request, env);
       }
 
@@ -213,9 +213,9 @@ async function admantumPostback(request, env) {
 
 async function adswedPostback(request, env) {
   if (!["GET", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
+  if (!env.DB || !env.ADSWED_SECRET_KEY) return new Response("server configuration error", { status: 500 });
+  await ensureSchema(env);
 
-  // Parse first so AdswedMedia's explicit test callback can verify endpoint reachability
-  // without requiring a live D1 binding or crediting any account.
   const q = await readPostbackParams(request);
   const subId = (q.get("subId") || "").trim();
   const transId = (q.get("transId") || "").trim();
@@ -224,24 +224,18 @@ async function adswedPostback(request, env) {
   const status = (q.get("status") || "1").trim();
   const type = (q.get("type") || "").trim().toLowerCase();
 
-  if (!subId || !transId || rawReward === null) {
+  if (!subId || !transId || rawReward === null || !signature) {
     return new Response("bad request", { status: 400 });
   }
 
-  // A provider-marked test event is acknowledged, never credited. Some dashboard
-  // test tools use a placeholder signature (or omit it), so do not require a live
-  // secret/database for this non-financial health check.
-  if (type === "test") return new Response("OK", { status: 200 });
-
-  if (!signature) return new Response("bad request", { status: 400 });
-  if (!env.DB || !env.ADSWED_SECRET_KEY) return new Response("server configuration error", { status: 500 });
-  await ensureSchema(env);
-
   // AdswedMedia documents: MD5(subId + transId + reward + SECRET_KEY).
   const expected = md5Hex(subId + transId + String(rawReward) + String(env.ADSWED_SECRET_KEY)).toLowerCase();
-  if (!constantTimeEqual(signature, expected)) {
-    return new Response("invalid signature", { status: 403 });
-  }
+
+if (!constantTimeEqual(signature, expected)) {
+  return new Response("invalid signature", { status: 403 });
+}
+  // Their testing tool can send type=test. Never credit test callbacks.
+  if (type === "test") return new Response("OK", { status: 200 });
 
   const user = await dbUserByDatabaseId(env.DB, subId);
   if (!user) return new Response("unknown user", { status: 404 });
@@ -380,7 +374,7 @@ async function processProviderPostback(request, env, provider, config) {
   }
 
   const original = await env.DB.prepare(`
-    SELECT amount,status,user_id FROM offerwall_conversions
+    SELECT amount,status FROM offerwall_conversions
     WHERE transaction_id=? LIMIT 1
   `).bind(providerTransactionId).first();
 
@@ -396,11 +390,11 @@ async function processProviderPostback(request, env, provider, config) {
         UPDATE wallets
         SET balance=MAX(0,balance+?), updated_at=?
         WHERE user_id=?
-      `).bind(reversal, now, original.user_id),
+      `).bind(reversal, now, user.id),
       env.DB.prepare(`
         INSERT INTO transactions(user_id,type,amount,description,created_at)
         VALUES(?,?,?,?,?)
-      `).bind(original.user_id, provider + "_offer_reversal", reversal, provider.toUpperCase() + " offer reversal", now)
+      `).bind(user.id, provider + "_offer_reversal", reversal, provider.toUpperCase() + " offer reversal", now)
     ]);
   } catch (e) {
     console.error(provider + " reversal error:", e);
@@ -1363,41 +1357,79 @@ async function sha256Hex(message) {
 /* WebCrypto in Cloudflare Workers does not provide MD5, but Tapjoy's
    legacy self-managed-currency callback requires MD5(id:snuid:currency:secret). */
 function md5Hex(input) {
+  // RFC 1321 MD5, implemented in JavaScript for Cloudflare Workers.
+  // MD5 is retained only for compatibility with providers that require it.
   const bytes = new TextEncoder().encode(String(input));
   const bitLength = bytes.length * 8;
-  const paddedLength = (((bytes.length + 8) >>> 6) + 1) * 64;
+  const paddedLength = Math.ceil((bytes.length + 9) / 64) * 64;
   const data = new Uint8Array(paddedLength);
   data.set(bytes);
   data[bytes.length] = 0x80;
-  const view = new DataView(data.buffer);
-  view.setUint32(paddedLength - 8, bitLength >>> 0, true);
-  view.setUint32(paddedLength - 4, Math.floor(bitLength / 0x100000000), true);
 
-  const shifts = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
-    5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
-    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
-    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
-  const K = Array.from({length:64}, (_,i) => Math.floor(Math.abs(Math.sin(i+1))*0x100000000) | 0);
-  let A=0x67452301, B=0xefcdab89|0, C=0x98badcfe|0, D=0x10325476;
-  for (let offset=0; offset<paddedLength; offset+=64) {
-    const M = new Int32Array(16);
-    for(let j=0;j<16;j++) M[j]=view.getInt32(offset+j*4,true);
-    let a=A,b=B,c=C,d=D;
-    for(let i=0;i<64;i++) {
-      let f,g;
-      if(i<16){ f=(b&c)|(~b&d); g=i; }
-      else if(i<32){ f=(d&b)|(~d&c); g=(5*i+1)%16; }
-      else if(i<48){ f=b^c^d; g=(3*i+5)%16; }
-      else { f=c^(b|~d); g=(7*i)%16; }
-      const sum=(a+f+K[i]+M[g])|0;
-      const rot=((sum<<shifts[i])|(sum>>>(32-shifts[i])))|0;
-      const next=(b+rot)|0;
-      a=d; d=c; c=b; b=next;
-    }
-    A=(A+a)|0; B=(B+b)|0; C=(C+c)|0; D=(D+d)|0;
+  // Append the original message length as a 64-bit little-endian integer.
+  const view = new DataView(data.buffer);
+  const low = bitLength >>> 0;
+  const high = Math.floor(bitLength / 0x100000000) >>> 0;
+  view.setUint32(paddedLength - 8, low, true);
+  view.setUint32(paddedLength - 4, high, true);
+
+  const shifts = [
+    7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
+    5,9,14,20, 5,9,14,20, 5,9,14,20, 5,9,14,20,
+    4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
+    6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21
+  ];
+  const constants = new Int32Array(64);
+  for (let i = 0; i < 64; i++) {
+    constants[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) | 0;
   }
-  const wordHex = n => [0,8,16,24].map(k=>((n>>>k)&255).toString(16).padStart(2,'0')).join('');
-  return wordHex(A)+wordHex(B)+wordHex(C)+wordHex(D);
+
+  let a0 = 0x67452301 | 0;
+  let b0 = 0xefcdab89 | 0;
+  let c0 = 0x98badcfe | 0;
+  let d0 = 0x10325476 | 0;
+  const words = new Int32Array(16);
+
+  for (let offset = 0; offset < paddedLength; offset += 64) {
+    for (let j = 0; j < 16; j++) words[j] = view.getInt32(offset + j * 4, true);
+    let a = a0, b = b0, c = c0, d = d0;
+
+    for (let i = 0; i < 64; i++) {
+      let f, g;
+      if (i < 16) {
+        f = (b & c) | (~b & d);
+        g = i;
+      } else if (i < 32) {
+        f = (d & b) | (~d & c);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        f = b ^ c ^ d;
+        g = (3 * i + 5) % 16;
+      } else {
+        f = c ^ (b | ~d);
+        g = (7 * i) % 16;
+      }
+      const sum = (a + f + constants[i] + words[g]) | 0;
+      const shift = shifts[i];
+      const rotated = (sum << shift) | (sum >>> (32 - shift));
+      const nextB = (b + rotated) | 0;
+      a = d;
+      d = c;
+      c = b;
+      b = nextB;
+    }
+    a0 = (a0 + a) | 0;
+    b0 = (b0 + b) | 0;
+    c0 = (c0 + c) | 0;
+    d0 = (d0 + d) | 0;
+  }
+
+  const hexWord = (word) => {
+    let out = '';
+    for (let i = 0; i < 4; i++) out += ((word >>> (i * 8)) & 255).toString(16).padStart(2, '0');
+    return out;
+  };
+  return hexWord(a0) + hexWord(b0) + hexWord(c0) + hexWord(d0);
 }
 
 async function hashPassword(password) {
@@ -1496,7 +1528,18 @@ button,input,select{font:inherit}button{cursor:pointer}.wrap{max-width:720px;mar
 .input,.select{width:100%;background:#0b1629;color:#fff;border:1px solid #334155;border-radius:13px;padding:13px;outline:none}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.68);z-index:20;display:flex;align-items:flex-end}.sheet{width:100%;max-height:90vh;overflow:auto;background:#0b1220;border-radius:24px 24px 0 0;padding:18px}
 .close{background:#1e293b;color:#fff;border:0;border-radius:10px;padding:9px 12px}.close-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.offer{padding:15px;border:1px solid #26354d;border-radius:17px;background:#0f1a2d;text-align:left}.offer strong{display:block;margin-bottom:5px}
+.offer{position:relative;display:flex;align-items:center;gap:14px;width:100%;min-height:100px;padding:16px;border:1px solid rgba(148,163,184,.17);border-radius:20px;background:linear-gradient(145deg,rgba(20,34,57,.98),rgba(12,23,41,.98));color:#eaf1ff;text-align:left;transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease;box-shadow:0 8px 22px rgba(0,0,0,.14)}
+.offer:active{transform:scale(.985)}.offer:hover{border-color:rgba(96,165,250,.55);box-shadow:0 10px 28px rgba(37,99,235,.12)}
+.offer strong{display:block;margin:0 0 5px;font-size:16px;letter-spacing:.1px;color:#f8fafc}.offer .small{display:block;font-size:12px;line-height:1.45;color:#a7b6cc}
+.offer-icon{width:50px;height:50px;flex:0 0 50px;display:grid;place-items:center;border-radius:16px;font-size:17px;font-weight:900;color:white;background:linear-gradient(135deg,#2563eb,#7c3aed);box-shadow:inset 0 1px 0 rgba(255,255,255,.2)}
+.offer-icon.tapjoy{background:linear-gradient(135deg,#2563eb,#06b6d4)}.offer-icon.cpidroid{background:linear-gradient(135deg,#7c3aed,#4f46e5)}.offer-icon.notik{background:linear-gradient(135deg,#db2777,#9333ea)}.offer-icon.admantum{background:linear-gradient(135deg,#ea580c,#d97706)}.offer-icon.offerwallgg{background:linear-gradient(135deg,#059669,#0d9488)}.offer-icon.adswed{background:linear-gradient(135deg,#0891b2,#2563eb)}
+.offer-copy{min-width:0;flex:1}.offer-meta{display:inline-flex;align-items:center;gap:5px;margin-top:8px;padding:4px 8px;border-radius:999px;background:rgba(59,130,246,.12);color:#93c5fd;font-size:10px;font-weight:800;letter-spacing:.4px;text-transform:uppercase}.offer-arrow{font-size:22px;color:#7186a5;flex:0 0 auto}
+.offer-hero{position:relative;overflow:hidden;background:radial-gradient(ellipse at 95% 0%,rgba(37,99,235,.27),transparent 45%),linear-gradient(135deg,#111f3b,#0c162a);border:1px solid rgba(96,165,250,.2)}
+.offer-hero:after{content:"";position:absolute;width:130px;height:130px;border:1px solid rgba(147,197,253,.08);border-radius:50%;right:-45px;bottom:-80px;box-shadow:0 0 0 18px rgba(147,197,253,.025),0 0 0 38px rgba(147,197,253,.02);pointer-events:none}
+.eyebrow{font-size:11px;font-weight:900;letter-spacing:1.5px;text-transform:uppercase;color:#60a5fa;margin-bottom:8px}.section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:15px}.section-head h2{font-size:21px;letter-spacing:-.4px;margin:0}.section-count{font-size:11px;font-weight:800;color:#94a3b8;background:#17243a;border:1px solid #26354d;padding:6px 9px;border-radius:999px}.offer-list{display:grid;gap:11px}.home-hero{background:radial-gradient(ellipse at 100% 0%,rgba(37,99,235,.22),transparent 48%),linear-gradient(135deg,#111f3b,#0c162a);border-color:rgba(96,165,250,.2)}
+.balance-label{display:flex;align-items:center;gap:8px;color:#a8b8cf;font-size:13px;font-weight:700}.balance-dot{width:8px;height:8px;border-radius:50%;background:#34d399;box-shadow:0 0 12px rgba(52,211,153,.6)}.balance{font-size:clamp(36px,9vw,48px);font-weight:900;letter-spacing:-1.8px;line-height:1.15;margin:10px 0 7px}.usd-line{color:#93a4bd;font-size:13px}.home-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}.home-actions .btn{min-height:54px}.home-actions .btn:first-child{grid-column:1/-1}
+@media(min-width:560px){.offer-list{grid-template-columns:repeat(2,minmax(0,1fr))}.offer{min-height:124px}.offer-icon{width:54px;height:54px;flex-basis:54px}}
+@media(max-width:430px){.offer{padding:14px;gap:12px}.offer-icon{width:46px;height:46px;flex-basis:46px;border-radius:14px}.offer strong{font-size:15px}.section-head h2{font-size:19px}.home-actions{grid-template-columns:1fr}.home-actions .btn:first-child{grid-column:auto}}
 .nav{position:fixed;left:0;right:0;bottom:0;background:rgba(7,17,31,.94);backdrop-filter:blur(10px);border-top:1px solid #26354d;display:flex;justify-content:center;z-index:10}.navin{max-width:720px;width:100%;display:grid;grid-template-columns:repeat(4,1fr);gap:5px;padding:8px}
 .nav button{background:transparent;color:#94a3b8;border:0;padding:8px 4px;font-size:12px}.nav button.active{color:#fff}
 .notice{padding:12px 14px;border-radius:13px;background:#0f1f38;color:#cbd5e1;font-size:13px}
@@ -1506,7 +1549,7 @@ button,input,select{font:inherit}button{cursor:pointer}.wrap{max-width:720px;mar
 </style>
 </head>
 <body>
-<div id="app"><div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">�9�8 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div class="notice">Website accounts use <b>email + password</b>. Telegram Mini App accounts use <b>Telegram authorization</b>.</div><div class="actions" style="margin-top:14px"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>
+<div id="app"><div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div class="notice">Website accounts use <b>email + password</b>. Telegram Mini App accounts use <b>Telegram authorization</b>.</div><div class="actions" style="margin-top:14px"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>
 <script>
 const TAPJOY_SDK_KEY=${JSON.stringify(TAPJOY_SDK_KEY)};
 const TAPJOY_PLACEMENT=${JSON.stringify(TAPJOY_PLACEMENT)};
@@ -1557,26 +1600,26 @@ function render(){
   const w=state.wallet||{},balance=Number(w.balance||0);
   document.getElementById('app').innerHTML=
   '<div class="wrap">'+
-    '<div class="top"><div><div class="brand">�9�8 Coin Cove</div><div class="small">Earn Coins and withdraw</div></div><button class="close" onclick="logout()">Log out</button></div>'+
+    '<div class="top"><div><div class="brand">Coin Cove</div><div class="small">Earn Coins and withdraw</div></div><button class="close" onclick="logout()">Log out</button></div>'+
     (page==='home'?homePage(balance):page==='offers'?offersPage():page==='withdraw'?withdrawPage(balance):accountPage())+
   '</div>'+
   '<div class="nav"><div class="navin">'+
-    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">�9�2<br>Home</button>'+
-    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">�9�7<br>Offers</button>'+
-    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">�9�8<br>Withdraw</button>'+
-    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">�9�4<br>Account</button>'+
+    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">⌂<br>Home</button>'+
+    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">▦<br>Offers</button>'+
+    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">⇄<br>Withdraw</button>'+
+    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">●<br>Account</button>'+
   '</div></div>';
 }
 function homePage(balance){
- return '<div class="card"><div class="small">Your balance</div><div class="balance">'+balance.toLocaleString()+' Coins</div><div class="small">�� $'+money()+'</div><div class="grid" style="margin-top:15px">'+
+ return '<div class="card home-hero"><div class="balance-label"><span class="balance-dot"></span> YOUR COIN BALANCE</div><div class="balance">'+balance.toLocaleString()+' <span style="font-size:17px;letter-spacing:0;color:#93c5fd">COINS</span></div><div class="usd-line">≈ $'+money()+' USD</div><div class="grid" style="margin-top:22px">'+
  '<div class="stat"><span class="small">Lifetime earned</span><b>'+Number(state.wallet.lifetime_earned||0).toLocaleString()+'</b></div>'+
  '<div class="stat"><span class="small">Referrals</span><b>'+Number(state.referrals?.count||0)+'</b></div></div></div>'+
- '<div class="card"><div class="title">Earn more</div><div class="actions">'+
- '<button class="btn" onclick="showTapjoy()">�7�3 Tapjoy Offerwall</button>'+
- '<button class="btn secondary" onclick="openOffers()">�9�7 Other Offerwalls</button>'+
- '<button class="btn good" onclick="watchAd()">�7�4 Watch rewarded ad</button>'+
+ '<div class="card"><div class="section-head"><div><div class="eyebrow">GET REWARDED</div><h2>Earn more coins</h2></div><span class="section-count">3 WAYS</span></div><div class="home-actions">'+
+ '<button class="btn" onclick="openOffers()">Explore offerwalls&nbsp; →</button>'+
+ '<button class="btn secondary" onclick="showTapjoy()">Tapjoy Offerwall</button>'+
+ '<button class="btn good" onclick="watchAd()">Watch rewarded ad</button>'+
  '</div></div>'+
- '<div class="card"><div class="title">Recent activity</div>'+txHtml()+'</div>';
+ '<div class="card"><div class="section-head"><h2>Recent activity</h2><span class="section-count">LATEST</span></div>'+txHtml()+'</div>';
 }
 function txHtml(){
  const tx=state.transactions||[];
@@ -1584,16 +1627,18 @@ function txHtml(){
  return tx.map(x=>'<div class="row" style="padding:9px 0;border-bottom:1px solid #1e293b"><div><b>'+esc(x.description||x.type)+'</b><div class="small">'+new Date(Number(x.created_at)*1000).toLocaleString()+'</div></div><strong>'+((Number(x.amount)>=0?'+':'')+Number(x.amount).toLocaleString())+'</strong></div>').join('');
 }
 function offersPage(){
- return '<div class="card"><h2>Offerwalls</h2><div class="notice">Complete eligible offers. Rewards are credited by each provider after its server callback is received.</div></div>'+
- '<div class="card"><div class="actions">'+
- '<button class="offer" onclick="showTapjoy()"><strong>�7�3 Tapjoy</strong><span class="small">Open Tapjoy Web Offerwall</span></button>'+
- '<button class="offer" onclick="openProvider(\'cpidroid\')"><strong>�9�3 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'notik\')"><strong>�9�2 Notik</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'admantum\')"><strong>�0�4 AdMantum</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'offerwallgg\')"><strong>�9�6 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'adswed\')"><strong>�0�8 AdswedMedia</strong><span class="small">Open provider wall</span></button>'+
- '</div></div>';
+ const provider=(name,cls,mark,desc,tag)=>'<button class="offer" onclick="'+(name==='tapjoy'?'showTapjoy()':'openProvider(\''+name+'\')')+'"><span class="offer-icon '+cls+'">'+mark+'</span><span class="offer-copy"><strong>'+nameLabel(name)+'</strong><span class="small">'+desc+'</span><span class="offer-meta">'+tag+'</span></span><span class="offer-arrow">›</span></button>';
+ return '<div class="card offer-hero"><div class="eyebrow">COIN COVE REWARDS</div><h2 style="font-size:25px;letter-spacing:-.6px;margin-bottom:9px">Choose your offerwall</h2><div class="muted" style="font-size:14px;line-height:1.65;max-width:460px">Complete available offers and tasks. Rewards are added after the provider confirms your completion.</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px"><span class="section-count">6 PROVIDERS</span><span class="section-count">SERVER-VERIFIED REWARDS</span></div></div>'+
+ '<div class="card"><div class="section-head"><div><div class="eyebrow">PARTNER NETWORK</div><h2>Available offerwalls</h2></div><span class="section-count">06</span></div><div class="offer-list">'+
+ provider('tapjoy','tapjoy','TJ','Discover games, apps and rewarded activities.','OPEN OFFERWALL')+
+ provider('cpidroid','cpidroid','CP','Explore app installs and partner offers.','OPEN OFFERWALL')+
+ provider('notik','notik','N','Find tasks and offers from Notik.','OPEN OFFERWALL')+
+ provider('admantum','admantum','A','Browse mobile offers and promotions.','OPEN OFFERWALL')+
+ provider('offerwallgg','offerwallgg','GG','Explore offers available through Offerwall.GG.','OPEN OFFERWALL')+
+ provider('adswed','adswed','AM','Complete eligible AdswedMedia offers.','OPEN OFFERWALL')+
+ '</div></div><div class="notice" style="margin:0 2px 16px;line-height:1.6">Tip: Complete each offer according to its instructions. Credit timing and eligibility are determined by the offer provider.</div>';
 }
+function nameLabel(name){return ({tapjoy:'Tapjoy',cpidroid:'CPIDroid',notik:'Notik',admantum:'AdMantum',offerwallgg:'Offerwall.GG',adswed:'AdswedMedia'})[name]||name}
 function openOffers(){page='offers';render()}
 function openProvider(name){
  const uid=encodeURIComponent(String(state.user?.id||''));
@@ -1608,7 +1653,7 @@ function openProvider(name){
  window.open(urls[name],'_blank','noopener,noreferrer');
 }
 function withdrawPage(balance){
- return '<div class="card"><h2>Withdraw</h2><div class="small">Available: '+balance.toLocaleString()+' Coins �� $'+money()+'</div></div>'+
+ return '<div class="card"><h2>Withdraw</h2><div class="small">Available: '+balance.toLocaleString()+' Coins · $'+money()+'</div></div>'+
  '<div class="card"><div class="actions">'+
  '<select id="wm" class="select"><option value="USDT_TRC20">USDT TRC20</option><option value="BINANCE_ID">Binance ID</option></select>'+
  '<input id="wd" class="input" placeholder="Wallet / Binance ID">'+
@@ -1620,7 +1665,7 @@ function withdrawPage(balance){
 function withdrawalsHtml(){
  const ws=state.withdrawals||[];
  if(!ws.length)return '<div class="muted">No withdrawals yet.</div>';
- return ws.map(x=>'<div class="row" style="padding:9px 0;border-bottom:1px solid #1e293b"><div><b>'+Number(x.coins).toLocaleString()+' Coins</b><div class="small">'+esc(x.method)+' �� '+new Date(Number(x.created_at)*1000).toLocaleString()+'</div></div><strong>'+esc(x.status)+'</strong></div>').join('');
+ return ws.map(x=>'<div class="row" style="padding:9px 0;border-bottom:1px solid #1e293b"><div><b>'+Number(x.coins).toLocaleString()+' Coins</b><div class="small">'+esc(x.method)+' · '+new Date(Number(x.created_at)*1000).toLocaleString()+'</div></div><strong>'+esc(x.status)+'</strong></div>').join('');
 }
 function accountPage(){
  return '<div class="card"><h2>Account</h2><div class="notice"><b>ID:</b> '+esc(state.user?.id)+'<br><b>Email:</b> '+esc(state.user?.email||'Telegram account')+'</div></div>'+
@@ -1658,10 +1703,10 @@ async function reload(){
 function loginScreen(){
  const app=document.getElementById('app');
  if(tg&&tg.initData){
-   app.innerHTML='<div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">�9�8 Coin Cove</div><h2>Telegram account</h2><p class="muted">This Mini App uses your Telegram account. Email/password login is disabled here.</p><div class="notice">If Telegram authorization is unavailable, close and reopen Coin Cove from <b>@Covecoinbot</b>.</div><button class="btn" style="margin-top:12px" onclick="location.reload()">Retry Telegram login</button></div></div>';
+   app.innerHTML='<div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">Coin Cove</div><h2>Telegram account</h2><p class="muted">This Mini App uses your Telegram account. Email/password login is disabled here.</p><div class="notice">If Telegram authorization is unavailable, close and reopen Coin Cove from <b>@Covecoinbot</b>.</div><button class="btn" style="margin-top:12px" onclick="location.reload()">Retry Telegram login</button></div></div>';
    return;
  }
- app.innerHTML='<div class="wrap"><div class="card" style="margin-top:12vh"><div class="brand">�9�8 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div id="authbox"><div class="actions"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>';
+ app.innerHTML='<div class="wrap"><div class="card" style="margin-top:12vh"><div class="brand">Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div id="authbox"><div class="actions"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>';
 }
 function showRegister(){
  document.getElementById('authbox').innerHTML='<div class="actions"><input id="re" class="input" type="email" placeholder="Email"><input id="rp" class="input" type="password" placeholder="Password (8+ characters)"><input id="rc" class="input" type="password" placeholder="Confirm password"><button class="btn" onclick="doRegister()">Create account</button><button class="btn secondary" onclick="loginScreen()">Back to login</button></div>';
