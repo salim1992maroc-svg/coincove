@@ -230,8 +230,27 @@ async function adswedPostback(request, env) {
 
   // AdswedMedia documents: MD5(subId + transId + reward + SECRET_KEY).
   const expected = md5Hex(subId + transId + String(rawReward) + String(env.ADSWED_SECRET_KEY)).toLowerCase();
-  if (!constantTimeEqual(signature, expected)) return new Response("invalid signature", { status: 403 });
+const secret = env.ADSWED_SECRET_KEY;
 
+console.log("ADSWED_DIAGNOSTIC", {
+  secretConfigured:
+    typeof secret === "string" && secret.length > 0,
+
+  secretLength:
+    typeof secret === "string" ? secret.length : 0,
+
+  md5SelfTest:
+    md5Hex("abc") ===
+    "900150983cd24fb0d6963f7d28e17f72",
+
+  signatureLength: signature.length,
+
+  signatureMatches: constantTimeEqual(signature, expected)
+});
+
+if (!constantTimeEqual(signature, expected)) {
+  return new Response("invalid signature", { status: 403 });
+}
   // Their testing tool can send type=test. Never credit test callbacks.
   if (type === "test") return new Response("OK", { status: 200 });
 
