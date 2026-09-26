@@ -1379,6 +1379,7 @@ function md5Hex(input) {
   function gg(a,b,c,d,x,s,t){return cmn((b&d)|(c&(~d)),a,b,x,s,t);}
   function hh(a,b,c,d,x,s,t){return cmn(b^c^d,a,b,x,s,t);}
   function ii(a,b,c,d,x,s,t){return cmn(c^(b|(~d)),a,b,x,s,t);}
+
   const bytes = new TextEncoder().encode(input);
   const len = bytes.length;
   const n = (((len + 8) >>> 6) + 1) * 16;
