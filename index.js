@@ -373,7 +373,7 @@ async function processProviderPostback(request, env, provider, config) {
   }
 
   const original = await env.DB.prepare(`
-    SELECT amount,status FROM offerwall_conversions
+    SELECT amount,status,user_id FROM offerwall_conversions
     WHERE transaction_id=? LIMIT 1
   `).bind(providerTransactionId).first();
 
@@ -389,11 +389,11 @@ async function processProviderPostback(request, env, provider, config) {
         UPDATE wallets
         SET balance=MAX(0,balance+?), updated_at=?
         WHERE user_id=?
-      `).bind(reversal, now, user.id),
+      `).bind(reversal, now, original.user_id),
       env.DB.prepare(`
         INSERT INTO transactions(user_id,type,amount,description,created_at)
         VALUES(?,?,?,?,?)
-      `).bind(user.id, provider + "_offer_reversal", reversal, provider.toUpperCase() + " offer reversal", now)
+      `).bind(original.user_id, provider + "_offer_reversal", reversal, provider.toUpperCase() + " offer reversal", now)
     ]);
   } catch (e) {
     console.error(provider + " reversal error:", e);
