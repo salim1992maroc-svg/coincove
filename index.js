@@ -73,7 +73,7 @@ export default {
       // AdswedMedia may be configured with the Worker root URL. Only treat the root as
       // a postback when the expected AdswedMedia parameters are present; normal visitors
       // without those parameters still receive the Coin Cove app.
-      if (url.pathname === "/" && ["subId", "transId", "reward", "signature"].every(k => url.searchParams.has(k))) {
+      if (url.pathname === "/" && ["subId", "transId", "reward"].every(k => url.searchParams.has(k)) && (url.searchParams.has("signature") || (url.searchParams.get("type") || "").toLowerCase() === "test")) {
         return adswedPostback(request, env);
       }
 
@@ -213,9 +213,9 @@ async function admantumPostback(request, env) {
 
 async function adswedPostback(request, env) {
   if (!["GET", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
-  if (!env.DB || !env.ADSWED_SECRET_KEY) return new Response("server configuration error", { status: 500 });
-  await ensureSchema(env);
 
+  // Parse first so AdswedMedia's explicit test callback can verify endpoint reachability
+  // without requiring a live D1 binding or crediting any account.
   const q = await readPostbackParams(request);
   const subId = (q.get("subId") || "").trim();
   const transId = (q.get("transId") || "").trim();
@@ -224,17 +224,24 @@ async function adswedPostback(request, env) {
   const status = (q.get("status") || "1").trim();
   const type = (q.get("type") || "").trim().toLowerCase();
 
-  if (!subId || !transId || rawReward === null || !signature) {
+  if (!subId || !transId || rawReward === null) {
     return new Response("bad request", { status: 400 });
   }
 
+  // A provider-marked test event is acknowledged, never credited. Some dashboard
+  // test tools use a placeholder signature (or omit it), so do not require a live
+  // secret/database for this non-financial health check.
+  if (type === "test") return new Response("OK", { status: 200 });
+
+  if (!signature) return new Response("bad request", { status: 400 });
+  if (!env.DB || !env.ADSWED_SECRET_KEY) return new Response("server configuration error", { status: 500 });
+  await ensureSchema(env);
+
   // AdswedMedia documents: MD5(subId + transId + reward + SECRET_KEY).
   const expected = md5Hex(subId + transId + String(rawReward) + String(env.ADSWED_SECRET_KEY)).toLowerCase();
-if (!constantTimeEqual(signature, expected)) {
-  return new Response("invalid signature", { status: 403 });
-}
-  // Their testing tool can send type=test. Never credit test callbacks.
-  if (type === "test") return new Response("OK", { status: 200 });
+  if (!constantTimeEqual(signature, expected)) {
+    return new Response("invalid signature", { status: 403 });
+  }
 
   const user = await dbUserByDatabaseId(env.DB, subId);
   if (!user) return new Response("unknown user", { status: 404 });
