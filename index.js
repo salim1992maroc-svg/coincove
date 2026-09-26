@@ -1058,9 +1058,9 @@ async function telegramWebhook(request, env) {
   if (!chatId) return new Response("ok", { status: 200 });
 
   const botUrl = String(env.TELEGRAM_WEBAPP_URL || new URL(request.url).origin);
-  let reply = "🌊 Coin Cove\n\nOpen Coin Cove to earn Coins and manage your account.";
+  let reply = "�9�8 Coin Cove\n\nOpen Coin Cove to earn Coins and manage your account.";
   if (/^\/(start|help)\b/i.test(text) || text === "") {
-    reply = "🌊 Welcome to Coin Cove!\n\nTap the button below to open Coin Cove with your Telegram account.";
+    reply = "�9�8 Welcome to Coin Cove!\n\nTap the button below to open Coin Cove with your Telegram account.";
   }
 
   try {
@@ -1069,7 +1069,7 @@ async function telegramWebhook(request, env) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId, text: reply,
-        reply_markup: { inline_keyboard: [[{ text: "🌊 Open Coin Cove", web_app: { url: botUrl } }]] }
+        reply_markup: { inline_keyboard: [[{ text: "�9�8 Open Coin Cove", web_app: { url: botUrl } }]] }
       })
     });
   } catch (e) { console.error("Telegram webhook sendMessage error:", e); }
@@ -1511,7 +1511,7 @@ button,input,select{font:inherit}button{cursor:pointer}.wrap{max-width:720px;mar
 </style>
 </head>
 <body>
-<div id="app"><div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">🌊 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div class="notice">Website accounts use <b>email + password</b>. Telegram Mini App accounts use <b>Telegram authorization</b>.</div><div class="actions" style="margin-top:14px"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>
+<div id="app"><div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">�9�8 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div class="notice">Website accounts use <b>email + password</b>. Telegram Mini App accounts use <b>Telegram authorization</b>.</div><div class="actions" style="margin-top:14px"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>
 <script>
 const TAPJOY_SDK_KEY=${JSON.stringify(TAPJOY_SDK_KEY)};
 const TAPJOY_PLACEMENT=${JSON.stringify(TAPJOY_PLACEMENT)};
@@ -1562,24 +1562,24 @@ function render(){
   const w=state.wallet||{},balance=Number(w.balance||0);
   document.getElementById('app').innerHTML=
   '<div class="wrap">'+
-    '<div class="top"><div><div class="brand">🌊 Coin Cove</div><div class="small">Earn Coins and withdraw</div></div><button class="close" onclick="logout()">Log out</button></div>'+
+    '<div class="top"><div><div class="brand">�9�8 Coin Cove</div><div class="small">Earn Coins and withdraw</div></div><button class="close" onclick="logout()">Log out</button></div>'+
     (page==='home'?homePage(balance):page==='offers'?offersPage():page==='withdraw'?withdrawPage(balance):accountPage())+
   '</div>'+
   '<div class="nav"><div class="navin">'+
-    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">🏠<br>Home</button>'+
-    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">🎁<br>Offers</button>'+
-    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">💸<br>Withdraw</button>'+
-    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">👤<br>Account</button>'+
+    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">�9�2<br>Home</button>'+
+    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">�9�7<br>Offers</button>'+
+    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">�9�8<br>Withdraw</button>'+
+    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">�9�4<br>Account</button>'+
   '</div></div>';
 }
 function homePage(balance){
- return '<div class="card"><div class="small">Your balance</div><div class="balance">'+balance.toLocaleString()+' Coins</div><div class="small">≈ $'+money()+'</div><div class="grid" style="margin-top:15px">'+
+ return '<div class="card"><div class="small">Your balance</div><div class="balance">'+balance.toLocaleString()+' Coins</div><div class="small">�� $'+money()+'</div><div class="grid" style="margin-top:15px">'+
  '<div class="stat"><span class="small">Lifetime earned</span><b>'+Number(state.wallet.lifetime_earned||0).toLocaleString()+'</b></div>'+
  '<div class="stat"><span class="small">Referrals</span><b>'+Number(state.referrals?.count||0)+'</b></div></div></div>'+
  '<div class="card"><div class="title">Earn more</div><div class="actions">'+
- '<button class="btn" onclick="showTapjoy()">⚡ Tapjoy Offerwall</button>'+
- '<button class="btn secondary" onclick="openOffers()">🎁 Other Offerwalls</button>'+
- '<button class="btn good" onclick="watchAd()">▶ Watch rewarded ad</button>'+
+ '<button class="btn" onclick="showTapjoy()">�7�3 Tapjoy Offerwall</button>'+
+ '<button class="btn secondary" onclick="openOffers()">�9�7 Other Offerwalls</button>'+
+ '<button class="btn good" onclick="watchAd()">�7�4 Watch rewarded ad</button>'+
  '</div></div>'+
  '<div class="card"><div class="title">Recent activity</div>'+txHtml()+'</div>';
 }
@@ -1591,12 +1591,12 @@ function txHtml(){
 function offersPage(){
  return '<div class="card"><h2>Offerwalls</h2><div class="notice">Complete eligible offers. Rewards are credited by each provider after its server callback is received.</div></div>'+
  '<div class="card"><div class="actions">'+
- '<button class="offer" onclick="showTapjoy()"><strong>⚡ Tapjoy</strong><span class="small">Open Tapjoy Web Offerwall</span></button>'+
- '<button class="offer" onclick="openProvider(\'cpidroid\')"><strong>🎯 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'notik\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'admantum\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'offerwallgg\')"><strong>💎 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'adswed\')"><strong>🟢 AdswedMedia</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="showTapjoy()"><strong>�7�3 Tapjoy</strong><span class="small">Open Tapjoy Web Offerwall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'cpidroid\')"><strong>�9�3 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'notik\')"><strong>�9�2 Notik</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'admantum\')"><strong>�0�4 AdMantum</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'offerwallgg\')"><strong>�9�6 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'adswed\')"><strong>�0�8 AdswedMedia</strong><span class="small">Open provider wall</span></button>'+
  '</div></div>';
 }
 function openOffers(){page='offers';render()}
@@ -1613,7 +1613,7 @@ function openProvider(name){
  window.open(urls[name],'_blank','noopener,noreferrer');
 }
 function withdrawPage(balance){
- return '<div class="card"><h2>Withdraw</h2><div class="small">Available: '+balance.toLocaleString()+' Coins ≈ $'+money()+'</div></div>'+
+ return '<div class="card"><h2>Withdraw</h2><div class="small">Available: '+balance.toLocaleString()+' Coins �� $'+money()+'</div></div>'+
  '<div class="card"><div class="actions">'+
  '<select id="wm" class="select"><option value="USDT_TRC20">USDT TRC20</option><option value="BINANCE_ID">Binance ID</option></select>'+
  '<input id="wd" class="input" placeholder="Wallet / Binance ID">'+
@@ -1625,7 +1625,7 @@ function withdrawPage(balance){
 function withdrawalsHtml(){
  const ws=state.withdrawals||[];
  if(!ws.length)return '<div class="muted">No withdrawals yet.</div>';
- return ws.map(x=>'<div class="row" style="padding:9px 0;border-bottom:1px solid #1e293b"><div><b>'+Number(x.coins).toLocaleString()+' Coins</b><div class="small">'+esc(x.method)+' · '+new Date(Number(x.created_at)*1000).toLocaleString()+'</div></div><strong>'+esc(x.status)+'</strong></div>').join('');
+ return ws.map(x=>'<div class="row" style="padding:9px 0;border-bottom:1px solid #1e293b"><div><b>'+Number(x.coins).toLocaleString()+' Coins</b><div class="small">'+esc(x.method)+' �� '+new Date(Number(x.created_at)*1000).toLocaleString()+'</div></div><strong>'+esc(x.status)+'</strong></div>').join('');
 }
 function accountPage(){
  return '<div class="card"><h2>Account</h2><div class="notice"><b>ID:</b> '+esc(state.user?.id)+'<br><b>Email:</b> '+esc(state.user?.email||'Telegram account')+'</div></div>'+
@@ -1663,10 +1663,10 @@ async function reload(){
 function loginScreen(){
  const app=document.getElementById('app');
  if(tg&&tg.initData){
-   app.innerHTML='<div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">🌊 Coin Cove</div><h2>Telegram account</h2><p class="muted">This Mini App uses your Telegram account. Email/password login is disabled here.</p><div class="notice">If Telegram authorization is unavailable, close and reopen Coin Cove from <b>@Covecoinbot</b>.</div><button class="btn" style="margin-top:12px" onclick="location.reload()">Retry Telegram login</button></div></div>';
+   app.innerHTML='<div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">�9�8 Coin Cove</div><h2>Telegram account</h2><p class="muted">This Mini App uses your Telegram account. Email/password login is disabled here.</p><div class="notice">If Telegram authorization is unavailable, close and reopen Coin Cove from <b>@Covecoinbot</b>.</div><button class="btn" style="margin-top:12px" onclick="location.reload()">Retry Telegram login</button></div></div>';
    return;
  }
- app.innerHTML='<div class="wrap"><div class="card" style="margin-top:12vh"><div class="brand">🌊 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div id="authbox"><div class="actions"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>';
+ app.innerHTML='<div class="wrap"><div class="card" style="margin-top:12vh"><div class="brand">�9�8 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div id="authbox"><div class="actions"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>';
 }
 function showRegister(){
  document.getElementById('authbox').innerHTML='<div class="actions"><input id="re" class="input" type="email" placeholder="Email"><input id="rp" class="input" type="password" placeholder="Password (8+ characters)"><input id="rc" class="input" type="password" placeholder="Confirm password"><button class="btn" onclick="doRegister()">Create account</button><button class="btn secondary" onclick="loginScreen()">Back to login</button></div>';
