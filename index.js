@@ -1,5 +1,5 @@
 const APP_NAME = "Coin Cove";
-const BUILD_VERSION = "2026-09-25-offerwalls-v8";
+const BUILD_VERSION = "2026-09-26-offerwalls-v9-adswed";
 const TAPJOY_SDK_KEY = "277Mt0yeQyuT_sZLoCUE_gEC0KXJGsauFETqGFqtLDz4ZQ0B_sGMBmpWRx1y";
 const TAPJOY_PLACEMENT = "coincover";
 const POINTS_NAME = "Coins";
@@ -20,6 +20,9 @@ const NOTIK_APP_ID = "fggvW50o8Z";
 const NOTIK_SECRET_KEY = "h6n79wyyoYgJuiNEqFwfzt5bLGhsgbGn";
 const CPIDROID_PLACEMENT = "yxpm-81812-kal5";
 const OFFERWALL_GG_PUBLIC_KEY = "4c826098db679c99583194371d0eae1b";
+const ADSWED_PUBLIC_KEY = "eJjhGO9M";
+// Keep the AdswedMedia secret in the Cloudflare Worker secret named ADSWED_SECRET_KEY.
+
 
 export default {
   async fetch(request, env) {
@@ -47,6 +50,7 @@ export default {
       if (url.pathname === "/api/offerwall/cpidroid/postback") return cpidroidPostback(request, env);
       if (url.pathname === "/api/offerwall/notik/postback") return notikPostback(request, env);
       if (url.pathname === "/api/offerwall/admantum/postback") return admantumPostback(request, env);
+      if (url.pathname === "/api/offerwall/adswed/postback") return adswedPostback(request, env);
       if (url.pathname === "/tapjoy/postback") return tapjoyPostback(request, env);
       if (url.pathname === "/monetag/postback") return monetagPostback(request, env);
 
@@ -65,6 +69,13 @@ export default {
       if (url.pathname === "/api/admin/withdrawal") return adminWithdrawalAction(request, env);
       if (url.pathname === "/api/admin/telegram/setup") return telegramSetup(request, env);
       if (url.pathname === "/api/telegram/webhook") return telegramWebhook(request, env);
+
+      // AdswedMedia may be configured with the Worker root URL. Only treat the root as
+      // a postback when the expected AdswedMedia parameters are present; normal visitors
+      // without those parameters still receive the Coin Cove app.
+      if (url.pathname === "/" && ["subId", "transId", "reward", "signature"].every(k => url.searchParams.has(k))) {
+        return adswedPostback(request, env);
+      }
 
       if (url.pathname === "/admin") {
         return new Response(renderAdmin(), {
@@ -197,6 +208,107 @@ async function admantumPostback(request, env) {
     console.error("AdMantum reversal error:", e);
     return new Response("server error", { status: 500 });
   }
+  return new Response("OK", { status: 200 });
+}
+
+async function adswedPostback(request, env) {
+  if (!["GET", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
+  if (!env.DB || !env.ADSWED_SECRET_KEY) return new Response("server configuration error", { status: 500 });
+  await ensureSchema(env);
+
+  const q = await readPostbackParams(request);
+  const subId = (q.get("subId") || "").trim();
+  const transId = (q.get("transId") || "").trim();
+  const rawReward = q.get("reward");
+  const signature = (q.get("signature") || "").trim().toLowerCase();
+  const status = (q.get("status") || "1").trim();
+  const type = (q.get("type") || "").trim().toLowerCase();
+
+  if (!subId || !transId || rawReward === null || !signature) {
+    return new Response("bad request", { status: 400 });
+  }
+
+  // AdswedMedia documents: MD5(subId + transId + reward + SECRET_KEY).
+  const expected = md5Hex(subId + transId + String(rawReward) + String(env.ADSWED_SECRET_KEY)).toLowerCase();
+  if (!constantTimeEqual(signature, expected)) return new Response("invalid signature", { status: 403 });
+
+  // Their testing tool can send type=test. Never credit test callbacks.
+  if (type === "test") return new Response("OK", { status: 200 });
+
+  const user = await dbUserByDatabaseId(env.DB, subId);
+  if (!user) return new Response("unknown user", { status: 404 });
+
+  const rewardNumber = Number(rawReward);
+  if (!Number.isFinite(rewardNumber) || rewardNumber <= 0) return new Response("invalid reward", { status: 400 });
+  const reward = Math.trunc(rewardNumber);
+  if (reward <= 0) return new Response("OK", { status: 200 });
+
+  const transactionId = "adswed:" + transId;
+  const now = Math.floor(Date.now() / 1000);
+  const offerId = q.get("offer_id") || null;
+  const offerName = q.get("offer_name") || "AdswedMedia offer";
+  const payoutRaw = q.get("payout") || "0";
+  const payout = Number(payoutRaw);
+  const safePayout = Number.isFinite(payout) && payout >= 0 ? payout : 0;
+
+  // Status 2 is a chargeback. It must reference the original transId and must
+  // never subtract the same reward twice.
+  if (status === "2") {
+    const original = await env.DB.prepare(`
+      SELECT id,user_id,amount,status FROM offerwall_conversions
+      WHERE transaction_id=? LIMIT 1
+    `).bind(transactionId).first();
+
+    if (!original) return new Response("OK", { status: 200 });
+    if (String(original.status).toLowerCase() === "reversed") return new Response("OK", { status: 200 });
+
+    const reversal = -Math.abs(Number(original.amount));
+    try {
+      await env.DB.batch([
+        env.DB.prepare("UPDATE offerwall_conversions SET status='reversed' WHERE transaction_id=?").bind(transactionId),
+        env.DB.prepare(`
+          UPDATE wallets SET balance=MAX(0,balance+?),updated_at=? WHERE user_id=?
+        `).bind(reversal, now, original.user_id),
+        env.DB.prepare(`
+          INSERT INTO transactions(user_id,type,amount,description,created_at)
+          VALUES(?,?,?,?,?)
+        `).bind(original.user_id, "adswed_offer_reversal", reversal, "AdswedMedia offer reversal", now)
+      ]);
+    } catch (e) {
+      console.error("AdswedMedia reversal error:", e);
+      return new Response("server error", { status: 500 });
+    }
+    return new Response("OK", { status: 200 });
+  }
+
+  // Only status 1 is a credit event. Other statuses are acknowledged without
+  // changing the user's balance.
+  if (status !== "1") return new Response("OK", { status: 200 });
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`
+        INSERT INTO offerwall_conversions
+        (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+      `).bind(transactionId, user.id, reward, "credited", offerId, offerName, q.get("event_id") || null, safePayout, 0, now),
+      env.DB.prepare(`
+        UPDATE wallets SET balance=balance+?,lifetime_earned=lifetime_earned+?,updated_at=? WHERE user_id=?
+      `).bind(reward, reward, now, user.id),
+      env.DB.prepare(`
+        INSERT INTO transactions(user_id,type,amount,description,created_at)
+        VALUES(?,?,?,?,?)
+      `).bind(user.id, "adswed_offer_reward", reward, "AdswedMedia offer reward", now)
+    ]);
+  } catch (e) {
+    const message = String(e?.message || e).toLowerCase();
+    // offerwall_conversions.transaction_id is UNIQUE, so a retry of the same
+    // transId is safely acknowledged and never credits twice.
+    if (message.includes("unique") || message.includes("constraint")) return new Response("DUP", { status: 200 });
+    console.error("AdswedMedia credit error:", e);
+    return new Response("server error", { status: 500 });
+  }
+
   return new Response("OK", { status: 200 });
 }
 
@@ -1484,6 +1596,7 @@ function offersPage(){
  '<button class="offer" onclick="openProvider(\'notik\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'admantum\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'offerwallgg\')"><strong>💎 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'adswed\')"><strong>🟢 AdswedMedia</strong><span class="small">Open provider wall</span></button>'+
  '</div></div>';
 }
 function openOffers(){page='offers';render()}
@@ -1493,7 +1606,8 @@ function openProvider(name){
   cpidroid:'https://wall.cpidroid.com/offer/yxpm-81812-kal5?uid='+uid+'&gaid=&idfa=',
   notik:'https://notik.me/coins?api_key=2eZo0UC1kNfCwjcFCYGpEWGwSDWzXJo9&pub_id=sLzA&app_id=fggvW50o8Z&user_id='+uid,
   admantum:'https://www.admantum.com/offers?appid=27938&uid='+uid,
-  offerwallgg:'https://offerwall.gg/wall/4c826098db679c99583194371d0eae1b?userId='+uid
+  offerwallgg:'https://offerwall.gg/wall/4c826098db679c99583194371d0eae1b?userId='+uid,
+  adswed:'https://adswedmedia.com/offer/'+${JSON.stringify(ADSWED_PUBLIC_KEY)}+'/'+uid
  };
  if(!urls[name]){alert('This provider is not configured yet.');return}
  window.open(urls[name],'_blank','noopener,noreferrer');
