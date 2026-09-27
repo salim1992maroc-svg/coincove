@@ -147,9 +147,11 @@ async function gaintwallPostback(request, env) {
   await ensureSchema(env);
 
   const q = await readPostbackParams(request);
-  const userId = (q.get('user_id') || '').trim();
-  const offerId = (q.get('offer_id') || '').trim();
-  const transactionIdRaw = (q.get('transaction_id') || '').trim();
+  // Accept the exact camelCase macros in GaintWall's documented Postback URL,
+  // while retaining snake_case aliases for backward compatibility.
+  const userId = (q.get('userId') || q.get('user_id') || '').trim();
+  const offerId = (q.get('offerId') || q.get('offer_id') || '').trim();
+  const transactionIdRaw = (q.get('transactionId') || q.get('transaction_id') || '').trim();
   const status = (q.get('status') || '').trim().toLowerCase();
   const rawReward = q.get('reward');
   const rawPayout = q.get('payout') || '0';
@@ -168,7 +170,7 @@ async function gaintwallPostback(request, env) {
 
   const transactionId = 'gaintwall:' + transactionIdRaw;
   const now = Math.floor(Date.now() / 1000);
-  const offerName = q.get('offer_name') || 'Gaintwall offer';
+  const offerName = q.get('offerName') || q.get('offer_name') || 'Gaintwall offer';
   const payout = Number(rawPayout);
   const safePayout = Number.isFinite(payout) && payout >= 0 ? payout : 0;
 
