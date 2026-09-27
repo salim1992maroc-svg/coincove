@@ -21,6 +21,7 @@ const NOTIK_SECRET_KEY = "h6n79wyyoYgJuiNEqFwfzt5bLGhsgbGn";
 const CPIDROID_PLACEMENT = "yxpm-81812-kal5";
 const OFFERWALL_GG_PUBLIC_KEY = "4c826098db679c99583194371d0eae1b";
 const ADSWED_PUBLIC_KEY = "eJjhGO9M";
+const OFFERME_PUBLIC_KEY = "5bXp8NOHWINp4PkGRsKynKJ7Ext3g4";
 // Keep the AdswedMedia secret in the Cloudflare Worker secret named ADSWED_SECRET_KEY.
 
 
@@ -51,6 +52,8 @@ export default {
       if (url.pathname === "/api/offerwall/notik/postback") return notikPostback(request, env);
       if (url.pathname === "/api/offerwall/admantum/postback") return admantumPostback(request, env);
       if (url.pathname === "/api/offerwall/adswed/postback") return adswedPostback(request, env);
+      if (url.pathname === "/api/offerme/postback") return offermePostback(request, env);
+      if (url.pathname === "/api/offerme/launch") return offermeLaunch(request, env);
       if (url.pathname === "/postback/gaintwall") return gaintwallPostback(request, env);
       if (url.pathname === "/tapjoy/postback") return tapjoyPostback(request, env);
       if (url.pathname === "/monetag/postback") return monetagPostback(request, env);
@@ -852,6 +855,84 @@ async function monetagPostback(request, env) {
     return new Response("server error", { status: 500 });
   }
 
+  return new Response("ok", { status: 200 });
+}
+
+async function offermeLaunch(request, env) {
+  if (request.method !== "GET") return json({ success: false, message: "Method not allowed." }, 405);
+  if (!env.DB || !env.OFFERME_SECRET_KEY) return json({ success: false, message: "Offerwall.me is not configured." }, 503);
+  await ensureSchema(env);
+  const identity = await resolveUserAuth(request, env);
+  if (!identity) return json({ success: false, message: "Authentication required." }, 401);
+
+  // Offerwall.me's identity signature binds the authenticated database user ID
+  // to this placement and expires after one hour. Never accept a user ID from
+  // the browser for this URL.
+  const expires = Math.floor(Date.now() / 1000) + 3600;
+  const message = `offerwall-user-v1\n${OFFERME_PUBLIC_KEY}\n${String(identity.userId)}\n${expires}`;
+  const signature = await hmacHexText(String(env.OFFERME_SECRET_KEY), message);
+  const target = new URL("https://offerwall.me/");
+  target.searchParams.set("api_key", OFFERME_PUBLIC_KEY);
+  target.searchParams.set("sub_id", String(identity.userId));
+  target.searchParams.set("expires", String(expires));
+  target.searchParams.set("signature", signature);
+  return json({ success: true, url: target.toString() });
+}
+
+async function offermePostback(request, env) {
+  if (request.method !== "GET" && request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  if (!env.DB || !env.OFFERME_SECRET_KEY) return new Response("server configuration error", { status: 500 });
+  await ensureSchema(env);
+  const q = await readPostbackParams(request);
+  const userId = String(q.get("subId") || q.get("sub_id") || "").trim();
+  const tx = String(q.get("transId") || q.get("trans_id") || "").trim();
+  const rewardRaw = q.get("reward");
+  const sig = String(q.get("signature") || "").trim();
+  const status = String(q.get("status") || "1").trim();
+  if (!userId || !tx || rewardRaw === null || !sig) return new Response("bad request", { status: 400 });
+
+  const expected = md5Hex(`${userId}${tx}${rewardRaw}${String(env.OFFERME_SECRET_KEY)}`);
+  if (!constantTimeEqual(expected.toLowerCase(), sig.toLowerCase())) return new Response("invalid signature", { status: 403 });
+  const user = await dbUserByDatabaseId(env.DB, userId);
+  if (!user) return new Response("unknown user", { status: 404 });
+  const now = Math.floor(Date.now() / 1000);
+
+  try {
+    if (status === "1") {
+      const reward = Number(rewardRaw);
+      if (!Number.isFinite(reward) || reward <= 0) return new Response("ok", { status: 200 });
+      const amount = Math.floor(reward);
+      if (amount <= 0) return new Response("ok", { status: 200 });
+      await env.DB.batch([
+        env.DB.prepare(`INSERT INTO offerwall_conversions
+          (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?)`)
+          .bind(`offerme:${tx}`, user.id, amount, "credited", q.get("offer_id") || null,
+            q.get("offer_name") || null, q.get("reward_name") || null,
+            Number(q.get("payout") || 0), 0, now),
+        env.DB.prepare("UPDATE wallets SET balance=balance+?,lifetime_earned=lifetime_earned+?,updated_at=? WHERE user_id=?")
+          .bind(amount, amount, now, user.id),
+        env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
+          .bind(user.id, "offerme_reward", amount, "Offerwall.me reward", now)
+      ]);
+    } else if (status === "2") {
+      const original = await env.DB.prepare("SELECT user_id,amount,status FROM offerwall_conversions WHERE transaction_id=? LIMIT 1")
+        .bind(`offerme:${tx}`).first();
+      if (!original || String(original.status).toLowerCase() === "reversed") return new Response("ok", { status: 200 });
+      const reversal = -Math.abs(Number(original.amount));
+      await env.DB.batch([
+        env.DB.prepare("UPDATE offerwall_conversions SET status='reversed' WHERE transaction_id=?").bind(`offerme:${tx}`),
+        env.DB.prepare("UPDATE wallets SET balance=MAX(0,balance+?),updated_at=? WHERE user_id=?").bind(reversal, now, original.user_id),
+        env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
+          .bind(original.user_id, "offerme_reversal", reversal, "Offerwall.me reversal", now)
+      ]);
+    }
+  } catch (e) {
+    const message = String(e?.message || e).toLowerCase();
+    if (message.includes("unique") || message.includes("constraint")) return new Response("ok", { status: 200 });
+    console.error("Offerwall.me postback error:", e);
+    return new Response("server error", { status: 500 });
+  }
   return new Response("ok", { status: 200 });
 }
 
@@ -1692,12 +1773,18 @@ function offersPage(){
  '<button class="offer" onclick="openProvider(\'admantum\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'offerwallgg\')"><strong>💎 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'adswed\')"><strong>🟢 AdswedMedia</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'offerme\')"><strong>🪙 Offerwall.me</strong><span class="small">Open provider wall</span></button>'+
 '<button class="offer" onclick="openProvider(\'gaintwall\')"><strong>🌟 Gaintwall</strong><span class="small">Open provider wall</span></button>'+
  '</div></div>';
 }
 function openOffers(){page='offers';render()}
-function openProvider(name){
+async function openProvider(name){
  const uid=encodeURIComponent(String(state.user?.id||''));
+ if(name==='offerme'){
+  try{const r=await fetch('/api/offerme/launch',{credentials:'include'});const d=await r.json();if(!r.ok||!d.success||!d.url)throw new Error(d.message||'Unable to open Offerwall.me');window.open(d.url,'_blank','noopener,noreferrer');}
+  catch(e){alert(e.message||'Unable to open Offerwall.me');}
+  return;
+ }
  const urls={
   cpidroid:'https://wall.cpidroid.com/offer/yxpm-81812-kal5?uid='+uid+'&gaid=&idfa=',
   notik:'https://notik.me/coins?api_key=2eZo0UC1kNfCwjcFCYGpEWGwSDWzXJo9&pub_id=sLzA&app_id=fggvW50o8Z&user_id='+uid,
