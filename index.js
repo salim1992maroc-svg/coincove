@@ -1579,6 +1579,7 @@ function renderApp() {
   return String.raw`<!doctype html>
 <html>
 <head>
+    <meta name="offerwall-verification" content="6ab99e9e140ec6c12c762bbd">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0f172a">
