@@ -1781,7 +1781,7 @@ function openOffers(){page='offers';render()}
 async function openProvider(name){
  const uid=encodeURIComponent(String(state.user?.id||''));
  if(name==='offerme'){
-  try{const r=await fetch('/api/offerme/launch',{credentials:'include'});const d=await r.json();if(!r.ok||!d.success||!d.url)throw new Error(d.message||'Unable to open Offerwall.me');window.open(d.url,'_blank','noopener,noreferrer');}
+  try{const d=await api('/api/offerme/launch');if(!d.success||!d.url)throw new Error(d.message||'Unable to open Offerwall.me');window.open(d.url,'_blank','noopener,noreferrer');}
   catch(e){alert(e.message||'Unable to open Offerwall.me');}
   return;
  }
