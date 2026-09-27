@@ -871,12 +871,12 @@ async function offermeLaunch(request, env) {
   const expires = Math.floor(Date.now() / 1000) + 3600;
   const message = `offerwall-user-v1\n${OFFERME_PUBLIC_KEY}\n${String(identity.userId)}\n${expires}`;
   const signature = await hmacHexText(String(env.OFFERME_SECRET_KEY), message);
-  const target = new URL("https://offerwall.me/");
-  target.searchParams.set("api_key", OFFERME_PUBLIC_KEY);
-  target.searchParams.set("sub_id", String(identity.userId));
-  target.searchParams.set("expires", String(expires));
-  target.searchParams.set("signature", signature);
-  return json({ success: true, url: target.toString() });
+  // Official hosted Offerwall.me path and signed-identity query names.
+  // The signed URL is generated only from the authenticated server-side user.
+  const target = new URL(`https://offerwall.me/offerwall/${encodeURIComponent(OFFERME_PUBLIC_KEY)}/${encodeURIComponent(String(identity.userId))}`);
+  target.searchParams.set("identityExpires", String(expires));
+  target.searchParams.set("identitySignature", signature);
+  return json({ success: true, url: target.toString() }, 200, { "Cache-Control": "no-store, private" });
 }
 
 async function offermePostback(request, env) {
@@ -1781,8 +1781,21 @@ function openOffers(){page='offers';render()}
 async function openProvider(name){
  const uid=encodeURIComponent(String(state.user?.id||''));
  if(name==='offerme'){
-  try{const d=await api('/api/offerme/launch');if(!d.success||!d.url)throw new Error(d.message||'Unable to open Offerwall.me');window.open(d.url,'_blank','noopener,noreferrer');}
-  catch(e){alert(e.message||'Unable to open Offerwall.me');}
+  try{
+   const d=await api('/api/offerme/launch');
+   if(!d.success||!d.url)throw new Error(d.message||'Unable to open Offerwall.me');
+   // Render the provider's hosted wall inside Coin Cove; its own enabled modules
+   // (offers, PTC, video, etc.) are controlled by the Offerwall.me placement.
+   const old=document.getElementById('offerme-wall-modal');if(old)old.remove();
+   const modal=document.createElement('div');modal.id='offerme-wall-modal';
+   modal.style.cssText='position:fixed;inset:0;z-index:99999;background:rgba(3,7,18,.96);display:flex;flex-direction:column;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);';
+   const bar=document.createElement('div');bar.style.cssText='height:54px;flex:0 0 54px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;background:#0b1224;color:#fff;border-bottom:1px solid rgba(157,181,255,.2);font-weight:800;';
+   const label=document.createElement('span');label.textContent='Offerwall.me';
+   const close=document.createElement('button');close.type='button';close.textContent='✕ Close';close.style.cssText='border:1px solid #33415f;border-radius:12px;padding:9px 13px;background:#17233b;color:#fff;font-weight:800;';
+   close.onclick=()=>modal.remove();bar.append(label,close);
+   const frame=document.createElement('iframe');frame.title='Offerwall.me Offers, PTC and Video Ads';frame.src=d.url;frame.setAttribute('allow','clipboard-read; clipboard-write');frame.setAttribute('referrerpolicy','no-referrer');frame.style.cssText='width:100%;height:100%;flex:1;border:0;background:#fff;';
+   modal.append(bar,frame);document.body.appendChild(modal);
+  }catch(e){alert(e.message||'Unable to open Offerwall.me');}
   return;
  }
  const urls={
