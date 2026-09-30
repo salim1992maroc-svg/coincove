@@ -53,6 +53,7 @@ export default {
       if (url.pathname === "/api/offerwall/notik/postback") return notikPostback(request, env);
       if (url.pathname === "/api/offerwall/admantum/postback") return admantumPostback(request, env);
       if (url.pathname === "/api/offerwall/adswed/postback") return adswedPostback(request, env);
+      if (url.pathname === "/api/offerwall/bitlabs/postback") return bitlabsPostback(request, env);
       if (url.pathname === "/api/offerme/postback") return offermePostback(request, env);
       if (url.pathname === "/api/offerme/launch") return offermeLaunch(request, env);
       if (url.pathname === "/postback/gaintwall") return gaintwallPostback(request, env);
@@ -1014,6 +1015,116 @@ async function offerwallPostback(request, env) {
   }
 
   return new Response("ok", { status: 200 });
+}
+
+
+async function hmacSha1Hex(keyBytes, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function bitlabsPostback(request, env) {
+  if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+  if (!env.DB || !env.BITLABS_SECRET_KEY) return new Response("server configuration error", { status: 500 });
+  await ensureSchema(env);
+
+  // BitLabs signs the exact callback URL before &hash=. Do not rebuild or decode it.
+  const fullUrl = request.url;
+  const parts = fullUrl.split("&hash=");
+  if (parts.length !== 2 || !parts[1]) return new Response("bad request", { status: 400 });
+
+  const suppliedHash = parts[1].split("&")[0].trim().toLowerCase();
+  const expectedHash = await hmacSha1Hex(new TextEncoder().encode(String(env.BITLABS_SECRET_KEY)), parts[0]);
+  if (!constantTimeEqual(suppliedHash, expectedHash)) return new Response("invalid hash", { status: 403 });
+
+  const q = new URL(request.url).searchParams;
+  const userId = (q.get("UID") || q.get("uid") || q.get("user_id") || "").trim();
+  const txRaw = (q.get("TX") || q.get("tx") || q.get("txid") || q.get("transaction_id") || "").trim();
+  const rewardRaw = q.get("VAL") ?? q.get("val") ?? q.get("value") ?? q.get("VALUE:CURRENCY");
+  const activity = (q.get("ACTIVITY:TYPE") || q.get("activity_type") || q.get("activity") || q.get("TYPE") || q.get("type") || "").trim().toUpperCase();
+  const ref = (q.get("REF") || q.get("ref") || "").trim();
+  const offerId = q.get("OFFER:ID") || q.get("offer_id") || q.get("of_id") || null;
+  const offerName = q.get("OFFER:NAME") || q.get("offer_name") || q.get("of_name") || "BitLabs offer";
+  const taskId = q.get("OFFER:TASK:ID") || q.get("task_id") || q.get("goal_id") || null;
+  const payoutRaw = q.get("RAW") ?? q.get("raw") ?? q.get("VALUE:USD") ?? q.get("value_usd") ?? "0";
+
+  if (!userId || !txRaw || rewardRaw === null) return new Response("bad request", { status: 400 });
+
+  const user = await dbUserByDatabaseId(env.DB, userId);
+  if (!user) return new Response("unknown user", { status: 404 });
+
+  const now = Math.floor(Date.now() / 1000);
+  const tx = "bitlabs:" + txRaw;
+
+  // Reconciliation must be linked to the original reward using REF when supplied.
+  if (activity === "RECONCILIATION" || activity === "RECONCILED") {
+    const originalTx = ref ? (ref.startsWith("bitlabs:") ? ref : "bitlabs:" + ref) : tx;
+    try {
+      const original = await env.DB.prepare(`
+        SELECT transaction_id,user_id,amount,status FROM offerwall_conversions WHERE transaction_id=? LIMIT 1
+      `).bind(originalTx).first();
+
+      if (!original) return new Response("OK", { status: 200 });
+      if (String(original.status).toLowerCase() === "reversed") return new Response("OK", { status: 200 });
+
+      const reversal = -Math.abs(Number(original.amount));
+      await env.DB.batch([
+        env.DB.prepare("UPDATE offerwall_conversions SET status=? WHERE transaction_id=?").bind("reversed", original.transaction_id),
+        env.DB.prepare(`UPDATE wallets SET balance=MAX(0,balance+?),updated_at=? WHERE user_id=?`).bind(reversal, now, original.user_id),
+        env.DB.prepare(`INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)`).bind(original.user_id, "bitlabs_offer_reversal", reversal, "BitLabs offer reconciliation", now)
+      ]);
+    } catch (e) {
+      const message = String(e?.message || e).toLowerCase();
+      if (message.includes("unique") || message.includes("constraint")) return new Response("OK", { status: 200 });
+      console.error("BitLabs reconciliation error:", e);
+      return new Response("server error", { status: 500 });
+    }
+    return new Response("OK", { status: 200 });
+  }
+
+  // Pending/screenout/start-bonus are not credited by this general reward handler.
+  if (activity === "PENDING" || activity === "SCREENOUT" || activity === "START_BONUS") {
+    return new Response("OK", { status: 200 });
+  }
+
+  const rewardNumber = Number(rewardRaw);
+  if (!Number.isFinite(rewardNumber) || rewardNumber <= 0) return new Response("OK", { status: 200 });
+  const reward = Math.trunc(rewardNumber);
+  if (reward <= 0) return new Response("OK", { status: 200 });
+
+  const payout = Number(payoutRaw);
+  const safePayout = Number.isFinite(payout) && payout >= 0 ? payout : 0;
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`
+        INSERT INTO offerwall_conversions
+        (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+      `).bind(tx, user.id, reward, "credited", offerId, offerName, taskId, safePayout, 0, now),
+      env.DB.prepare(`
+        UPDATE wallets SET balance=balance+?,lifetime_earned=lifetime_earned+?,updated_at=? WHERE user_id=?
+      `).bind(reward, reward, now, user.id),
+      env.DB.prepare(`
+        INSERT INTO transactions(user_id,type,amount,description,created_at)
+        VALUES(?,?,?,?,?)
+      `).bind(user.id, "bitlabs_offer_reward", reward, "BitLabs offer reward", now)
+    ]);
+  } catch (e) {
+    const message = String(e?.message || e).toLowerCase();
+    if (message.includes("unique") || message.includes("constraint")) return new Response("OK", { status: 200 });
+    console.error("BitLabs postback error:", e);
+    return new Response("server error", { status: 500 });
+  }
+
+  return new Response("OK", { status: 200 });
 }
 
 async function emailRegister(request, env) {
