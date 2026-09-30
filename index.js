@@ -22,6 +22,7 @@ const CPIDROID_PLACEMENT = "yxpm-81812-kal5";
 const OFFERWALL_GG_PUBLIC_KEY = "4c826098db679c99583194371d0eae1b";
 const ADSWED_PUBLIC_KEY = "eJjhGO9M";
 const OFFERME_PUBLIC_KEY = "5bXp8NOHWINp4PkGRsKynKJ7Ext3g4";
+const BITLABS_APP_TOKEN = "0bd8ff38-7c10-44a7-87be-3e16f8d5c47c";
 // Keep the AdswedMedia secret in the Cloudflare Worker secret named ADSWED_SECRET_KEY.
 
 
@@ -52,7 +53,6 @@ export default {
       if (url.pathname === "/api/offerwall/notik/postback") return notikPostback(request, env);
       if (url.pathname === "/api/offerwall/admantum/postback") return admantumPostback(request, env);
       if (url.pathname === "/api/offerwall/adswed/postback") return adswedPostback(request, env);
-      if (url.pathname === "/api/offerwall/bitlabs/postback") return bitlabsPostback(request, env);
       if (url.pathname === "/api/offerme/postback") return offermePostback(request, env);
       if (url.pathname === "/api/offerme/launch") return offermeLaunch(request, env);
       if (url.pathname === "/postback/gaintwall") return gaintwallPostback(request, env);
@@ -389,140 +389,6 @@ async function adswedPostback(request, env) {
     // transId is safely acknowledged and never credits twice.
     if (message.includes("unique") || message.includes("constraint")) return new Response("DUP", { status: 200 });
     console.error("AdswedMedia credit error:", e);
-    return new Response("server error", { status: 500 });
-  }
-
-  return new Response("OK", { status: 200 });
-}
-
-async function bitlabsPostback(request, env) {
-  // BitLabs general reward callbacks are HTTP GET requests and always include
-  // a SHA-1 HMAC hash of the exact callback URL (without &hash=...) using the
-  // App Secret. Keep the secret in a Cloudflare Worker secret.
-  if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
-  if (!env.DB || !env.BITLABS_SECRET_KEY) return new Response("server configuration error", { status: 500 });
-  await ensureSchema(env);
-
-  const requestUrl = request.url;
-  const hashMarker = "&hash=";
-  const hashIndex = requestUrl.lastIndexOf(hashMarker);
-  if (hashIndex < 0) return new Response("bad request", { status: 400 });
-
-  const signedUrl = requestUrl.slice(0, hashIndex);
-  const receivedHash = requestUrl.slice(hashIndex + hashMarker.length).split("&", 1)[0].trim().toLowerCase();
-  if (!receivedHash) return new Response("bad request", { status: 400 });
-
-  const expectedHash = await hmacSha1Hex(
-    new TextEncoder().encode(String(env.BITLABS_SECRET_KEY)),
-    signedUrl
-  );
-  if (!constantTimeEqual(receivedHash, expectedHash)) return new Response("invalid hash", { status: 403 });
-
-  const q = await readPostbackParams(request);
-  const first = (...keys) => {
-    for (const key of keys) {
-      const value = q.get(key);
-      if (value !== null && String(value).trim() !== "") return String(value).trim();
-    }
-    return "";
-  };
-
-  // General BitLabs callback parameters. We accept both the documented short
-  // names and common lower/upper-case variants so dashboard configuration is
-  // not unnecessarily brittle.
-  const userId = first("UID", "uid", "user_id", "USER:UID");
-  const tx = first("TX", "tx", "txid", "transaction_id");
-  const rawReward = first("VAL", "val", "value", "VALUE:CURRENCY");
-  const activity = first("ACTIVITY:TYPE", "activity_type", "activity", "TYPE", "type").toUpperCase();
-  const ref = first("REF", "ref");
-
-  if (!userId || !tx || rawReward === "") return new Response("bad request", { status: 400 });
-
-  const user = await dbUserByDatabaseId(env.DB, userId);
-  if (!user) return new Response("unknown user", { status: 404 });
-
-  const rewardNumber = Number(rawReward);
-  if (!Number.isFinite(rewardNumber)) return new Response("invalid reward", { status: 400 });
-
-  const now = Math.floor(Date.now() / 1000);
-  const transactionId = "bitlabs:" + tx;
-  const offerId = first("OFFER:ID", "offer_id", "of_id") || null;
-  const offerName = first("OFFER:NAME", "offer_name", "of_name") || "BitLabs offer";
-  const taskId = first("OFFER:TASK:ID", "task_id", "goal_id") || null;
-  const payoutUsdRaw = first("RAW", "raw", "VALUE:USD", "value_usd") || "0";
-  const payoutUsd = Number(payoutUsdRaw);
-  const safePayoutUsd = Number.isFinite(payoutUsd) ? payoutUsd : 0;
-
-  // Reconciliation must never be inferred only from a negative/zero reward.
-  // BitLabs provides ACTIVITY:TYPE and REF specifically for matching reversals.
-  if (activity === "RECONCILIATION" || activity === "RECONCILED") {
-    const referenceTx = ref ? "bitlabs:" + ref : transactionId;
-    const original = await env.DB.prepare(`
-      SELECT transaction_id,user_id,amount,status
-      FROM offerwall_conversions
-      WHERE transaction_id=? LIMIT 1
-    `).bind(referenceTx).first();
-
-    // A reconciliation may arrive without a prior callback. In that case
-    // there is nothing to deduct, but BitLabs should still receive HTTP 200.
-    if (!original) return new Response("OK", { status: 200 });
-    if (String(original.status).toLowerCase() === "reversed") return new Response("OK", { status: 200 });
-
-    const reversal = -Math.abs(Number(original.amount));
-    if (!Number.isFinite(reversal) || reversal === 0) return new Response("OK", { status: 200 });
-
-    try {
-      await env.DB.batch([
-        env.DB.prepare(`
-          UPDATE offerwall_conversions SET status='reversed' WHERE transaction_id=?
-        `).bind(original.transaction_id),
-        env.DB.prepare(`
-          UPDATE wallets SET balance=MAX(0,balance+?),updated_at=? WHERE user_id=?
-        `).bind(reversal, now, original.user_id),
-        env.DB.prepare(`
-          INSERT INTO transactions(user_id,type,amount,description,created_at)
-          VALUES(?,?,?,?,?)
-        `).bind(original.user_id, "bitlabs_offer_reversal", reversal, "BitLabs offer reconciliation", now)
-      ]);
-    } catch (e) {
-      console.error("BitLabs reconciliation error:", e);
-      return new Response("server error", { status: 500 });
-    }
-    return new Response("OK", { status: 200 });
-  }
-
-  // Pending/state-change callbacks do not represent an earned balance yet.
-  if (activity === "PENDING" || activity === "START_BONUS" || activity === "SCREENOUT") {
-    return new Response("OK", { status: 200 });
-  }
-
-  // A normal completed reward must be positive. Zero-dollar callbacks can be
-  // enabled in BitLabs, but they should not create a Coin Cove wallet credit.
-  if (rewardNumber <= 0) return new Response("OK", { status: 200 });
-  const reward = Math.floor(rewardNumber);
-  if (reward <= 0) return new Response("OK", { status: 200 });
-
-  try {
-    await env.DB.batch([
-      env.DB.prepare(`
-        INSERT INTO offerwall_conversions
-        (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?)
-      `).bind(transactionId, user.id, reward, "credited", offerId, offerName, taskId, safePayoutUsd, 0, now),
-      env.DB.prepare(`
-        UPDATE wallets SET balance=balance+?,lifetime_earned=lifetime_earned+?,updated_at=? WHERE user_id=?
-      `).bind(reward, reward, now, user.id),
-      env.DB.prepare(`
-        INSERT INTO transactions(user_id,type,amount,description,created_at)
-        VALUES(?,?,?,?,?)
-      `).bind(user.id, "bitlabs_offer_reward", reward, "BitLabs offer reward", now)
-    ]);
-  } catch (e) {
-    const message = String(e?.message || e).toLowerCase();
-    // TX is unique in Coin Cove, so BitLabs retries are acknowledged without
-    // crediting the user a second time.
-    if (message.includes("unique") || message.includes("constraint")) return new Response("OK", { status: 200 });
-    console.error("BitLabs credit error:", e);
     return new Response("server error", { status: 500 });
   }
 
@@ -1638,12 +1504,6 @@ async function hmacSha256Hex(keyBytes, message) {
   return Array.from(new Uint8Array(s)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function hmacSha1Hex(keyBytes, message) {
-  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
-  const s = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
-  return Array.from(new Uint8Array(s)).map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
 async function hmacHexText(secret, message) {
   return hmacSha256Hex(new TextEncoder().encode(secret), message);
 }
@@ -1916,11 +1776,27 @@ function offersPage(){
  '<button class="offer" onclick="openProvider(\'adswed\')"><strong>🟢 AdswedMedia</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'offerme\')"><strong>🪙 Offerwall.me</strong><span class="small">Open provider wall</span></button>'+
 '<button class="offer" onclick="openProvider(\'gaintwall\')"><strong>🌟 Gaintwall</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" onclick="openProvider(\'bitlabs\')"><strong>🧪 BitLabs</strong><span class="small">Offers, Games & Surveys</span></button>'+
  '</div></div>';
 }
 function openOffers(){page='offers';render()}
 async function openProvider(name){
  const uid=encodeURIComponent(String(state.user?.id||''));
+ if(name==='bitlabs'){
+  if(!uid){alert('Unable to identify your Coin Cove user.');return;}
+  const old=document.getElementById('bitlabs-wall-modal');if(old)old.remove();
+  const modal=document.createElement('div');modal.id='bitlabs-wall-modal';
+  modal.style.cssText='position:fixed;inset:0;z-index:99999;background:rgba(3,7,18,.96);display:flex;flex-direction:column;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);';
+  const bar=document.createElement('div');bar.style.cssText='height:54px;flex:0 0 54px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;background:#0b1224;color:#fff;border-bottom:1px solid rgba(157,181,255,.2);font-weight:800;';
+  const label=document.createElement('span');label.textContent='BitLabs';
+  const close=document.createElement('button');close.type='button';close.textContent='✕ Close';close.style.cssText='border:1px solid #33415f;border-radius:12px;padding:9px 13px;background:#17233b;color:#fff;font-weight:800;';
+  close.onclick=()=>modal.remove();bar.append(label,close);
+  const frame=document.createElement('iframe');frame.title='BitLabs Offers, Games and Surveys';
+  frame.src='https://web.bitlabs.ai/?uid='+uid+'&token='+encodeURIComponent(${JSON.stringify(BITLABS_APP_TOKEN)})+'&display_mode=all&sdk=IFRAME&in_app=true&theme=DARK';
+  frame.setAttribute('allow','clipboard-read; clipboard-write');frame.setAttribute('referrerpolicy','no-referrer');frame.style.cssText='width:100%;height:100%;flex:1;border:0;background:#fff;';
+  modal.append(bar,frame);document.body.appendChild(modal);
+  return;
+ }
  if(name==='offerme'){
   try{
    const d=await api('/api/offerme/launch');
