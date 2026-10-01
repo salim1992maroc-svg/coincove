@@ -1030,19 +1030,84 @@ async function hmacSha1Hex(keyBytes, message) {
   return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+function bitlabsCallbackResponse(code, status, details = {}) {
+  const payload = { provider: "bitlabs", code, ...details };
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=UTF-8",
+      "cache-control": "no-store"
+    }
+  });
+}
+
 async function bitlabsPostback(request, env) {
-  if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
-  if (!env.DB || !env.BITLABS_SECRET_KEY) return new Response("server configuration error", { status: 500 });
-  await ensureSchema(env);
+  if (request.method !== "GET") {
+    return bitlabsCallbackResponse("METHOD_NOT_ALLOWED", 405, { method: request.method });
+  }
 
-  // BitLabs signs the exact callback URL before &hash=. Do not rebuild or decode it.
+  if (!env.DB) {
+    console.error("BitLabs callback: DB binding is missing");
+    return bitlabsCallbackResponse("DB_NOT_CONFIGURED", 500);
+  }
+
+  if (!env.BITLABS_SECRET_KEY) {
+    console.error("BitLabs callback: BITLABS_SECRET_KEY is missing");
+    return bitlabsCallbackResponse("SECRET_NOT_CONFIGURED", 500);
+  }
+
+  try {
+    await ensureSchema(env);
+  } catch (e) {
+    console.error("BitLabs callback: schema error", e);
+    return bitlabsCallbackResponse("SCHEMA_ERROR", 500, {
+      message: String(e?.message || e).slice(0, 300)
+    });
+  }
+
+  // BitLabs signs the exact callback URL before &hash=. Keep the original URL
+  // untouched: do not rebuild, decode, normalize, or reorder its parameters.
   const fullUrl = request.url;
-  const parts = fullUrl.split("&hash=");
-  if (parts.length !== 2 || !parts[1]) return new Response("bad request", { status: 400 });
+  const hashMarker = "&hash=";
+  const hashIndex = fullUrl.indexOf(hashMarker);
 
-  const suppliedHash = parts[1].split("&")[0].trim().toLowerCase();
-  const expectedHash = await hmacSha1Hex(new TextEncoder().encode(String(env.BITLABS_SECRET_KEY)), parts[0]);
-  if (!constantTimeEqual(suppliedHash, expectedHash)) return new Response("invalid hash", { status: 403 });
+  if (hashIndex === -1) {
+    console.error("BitLabs callback: hash parameter not found", fullUrl);
+    return bitlabsCallbackResponse("HASH_MISSING", 400, {
+      expected: "URL must contain &hash=<hmac>"
+    });
+  }
+
+  const signedUrl = fullUrl.slice(0, hashIndex);
+  const hashAndAfter = fullUrl.slice(hashIndex + hashMarker.length);
+  const suppliedHash = hashAndAfter.split("&", 1)[0].trim().toLowerCase();
+
+  if (!suppliedHash) {
+    console.error("BitLabs callback: hash parameter is empty");
+    return bitlabsCallbackResponse("HASH_EMPTY", 400);
+  }
+
+  let expectedHash;
+  try {
+    expectedHash = await hmacSha1Hex(
+      new TextEncoder().encode(String(env.BITLABS_SECRET_KEY)),
+      signedUrl
+    );
+  } catch (e) {
+    console.error("BitLabs callback: HMAC calculation error", e);
+    return bitlabsCallbackResponse("HMAC_ERROR", 500);
+  }
+
+  if (!constantTimeEqual(suppliedHash, expectedHash)) {
+    console.error("BitLabs callback: invalid hash", {
+      hashLength: suppliedHash.length,
+      expectedLength: expectedHash.length
+    });
+    return bitlabsCallbackResponse("INVALID_HASH", 403, {
+      hashLength: suppliedHash.length,
+      expectedLength: expectedHash.length
+    });
+  }
 
   const q = new URL(request.url).searchParams;
   const userId = (q.get("UID") || q.get("uid") || q.get("user_id") || "").trim();
@@ -1055,10 +1120,20 @@ async function bitlabsPostback(request, env) {
   const taskId = q.get("OFFER:TASK:ID") || q.get("task_id") || q.get("goal_id") || null;
   const payoutRaw = q.get("RAW") ?? q.get("raw") ?? q.get("VALUE:USD") ?? q.get("value_usd") ?? "0";
 
-  if (!userId || !txRaw || rewardRaw === null) return new Response("bad request", { status: 400 });
+  if (!userId) {
+    return bitlabsCallbackResponse("USER_ID_MISSING", 400, { parameter: "UID" });
+  }
+  if (!txRaw) {
+    return bitlabsCallbackResponse("TRANSACTION_ID_MISSING", 400, { parameter: "TX" });
+  }
+  if (rewardRaw === null) {
+    return bitlabsCallbackResponse("REWARD_MISSING", 400, { parameter: "VAL" });
+  }
 
   const user = await dbUserByDatabaseId(env.DB, userId);
-  if (!user) return new Response("unknown user", { status: 404 });
+  if (!user) {
+    return bitlabsCallbackResponse("UNKNOWN_USER", 404, { userId });
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const tx = "bitlabs:" + txRaw;
@@ -1071,8 +1146,8 @@ async function bitlabsPostback(request, env) {
         SELECT transaction_id,user_id,amount,status FROM offerwall_conversions WHERE transaction_id=? LIMIT 1
       `).bind(originalTx).first();
 
-      if (!original) return new Response("OK", { status: 200 });
-      if (String(original.status).toLowerCase() === "reversed") return new Response("OK", { status: 200 });
+      if (!original) return bitlabsCallbackResponse("RECONCILIATION_ALREADY_HANDLED", 200);
+      if (String(original.status).toLowerCase() === "reversed") return bitlabsCallbackResponse("RECONCILIATION_ALREADY_REVERSED", 200);
 
       const reversal = -Math.abs(Number(original.amount));
       await env.DB.batch([
@@ -1082,22 +1157,25 @@ async function bitlabsPostback(request, env) {
       ]);
     } catch (e) {
       const message = String(e?.message || e).toLowerCase();
-      if (message.includes("unique") || message.includes("constraint")) return new Response("OK", { status: 200 });
+      if (message.includes("unique") || message.includes("constraint")) return bitlabsCallbackResponse("RECONCILIATION_ALREADY_HANDLED", 200);
       console.error("BitLabs reconciliation error:", e);
-      return new Response("server error", { status: 500 });
+      return bitlabsCallbackResponse("RECONCILIATION_DB_ERROR", 500, { message: String(e?.message || e).slice(0, 300) });
     }
-    return new Response("OK", { status: 200 });
+    return bitlabsCallbackResponse("RECONCILIATION_OK", 200);
   }
 
   // Pending/screenout/start-bonus are not credited by this general reward handler.
   if (activity === "PENDING" || activity === "SCREENOUT" || activity === "START_BONUS") {
-    return new Response("OK", { status: 200 });
+    return bitlabsCallbackResponse("IGNORED_ACTIVITY", 200, { activity });
   }
 
   const rewardNumber = Number(rewardRaw);
-  if (!Number.isFinite(rewardNumber) || rewardNumber <= 0) return new Response("OK", { status: 200 });
+  if (!Number.isFinite(rewardNumber) || rewardNumber <= 0) {
+    return bitlabsCallbackResponse("IGNORED_NON_POSITIVE_REWARD", 200, { reward: String(rewardRaw) });
+  }
+
   const reward = Math.trunc(rewardNumber);
-  if (reward <= 0) return new Response("OK", { status: 200 });
+  if (reward <= 0) return bitlabsCallbackResponse("IGNORED_NON_POSITIVE_REWARD", 200, { reward: String(rewardRaw) });
 
   const payout = Number(payoutRaw);
   const safePayout = Number.isFinite(payout) && payout >= 0 ? payout : 0;
@@ -1119,12 +1197,17 @@ async function bitlabsPostback(request, env) {
     ]);
   } catch (e) {
     const message = String(e?.message || e).toLowerCase();
-    if (message.includes("unique") || message.includes("constraint")) return new Response("OK", { status: 200 });
+    if (message.includes("unique") || message.includes("constraint")) return bitlabsCallbackResponse("DUPLICATE_CALLBACK", 200, { transactionId: txRaw });
     console.error("BitLabs postback error:", e);
-    return new Response("server error", { status: 500 });
+    return bitlabsCallbackResponse("REWARD_DB_ERROR", 500, { message: String(e?.message || e).slice(0, 300) });
   }
 
-  return new Response("OK", { status: 200 });
+  return bitlabsCallbackResponse("REWARD_OK", 200, {
+    userId,
+    transactionId: txRaw,
+    reward,
+    activity: activity || "REWARD"
+  });
 }
 
 async function emailRegister(request, env) {
