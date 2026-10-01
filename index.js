@@ -1161,6 +1161,9 @@ async function bitlabsPostback(request, env) {
     });
   }
 
+  const q = new URL(request.url).searchParams;
+  const isDebug = q.get("debug") === "true";
+
   if (matchedCandidate !== "raw") {
     console.warn("BitLabs callback: hash matched normalized tester URL", {
       matchedCandidate,
@@ -1168,7 +1171,19 @@ async function bitlabsPostback(request, env) {
     });
   }
 
-  const q = new URL(request.url).searchParams;
+  // BitLabs Callback Tester sends debug=true. A tester request must validate
+  // the signature but must never require a real CoinCove user, create a reward,
+  // or fail because the static tester UID/TX is not a production conversion.
+  // This keeps the production path unchanged while allowing BitLabs to receive
+  // the expected HTTP 200 from the tester.
+  if (isDebug) {
+    return bitlabsCallbackResponse("DEBUG_HASH_OK", 200, {
+      matchedCandidate,
+      transactionId: q.get("TX") || q.get("tx") || null,
+      userId: q.get("UID") || q.get("uid") || null
+    });
+  }
+
   const userId = (q.get("UID") || q.get("uid") || q.get("user_id") || "").trim();
   const txRaw = (q.get("TX") || q.get("tx") || q.get("txid") || q.get("transaction_id") || "").trim();
   const rewardRaw = q.get("VAL") ?? q.get("val") ?? q.get("value") ?? q.get("VALUE:CURRENCY");
