@@ -1030,6 +1030,14 @@ async function hmacSha1Hex(keyBytes, message) {
   return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function bitlabsCallbackResponse(code, status, details = {}) {
   const payload = { provider: "bitlabs", code, ...details };
   return new Response(JSON.stringify(payload), {
@@ -1087,25 +1095,62 @@ async function bitlabsPostback(request, env) {
     return bitlabsCallbackResponse("HASH_EMPTY", 400);
   }
 
-  let expectedHash;
+  // BitLabs signs the exact URL string it sends, before &hash=.
+  // Cloudflare exposes the request URL in its serialized form. The exact form
+  // is always tried first, as required by BitLabs. For the dashboard tester
+  // only, we also test equivalent URL representations because its displayed
+  // callback can differ from the HTTP-serialized query string (e.g. + vs space
+  // or percent-encoding). We never use these variants unless their HMAC matches.
+  const candidates = [
+    { name: "raw", value: signedUrl },
+    { name: "plus-as-space", value: signedUrl.replace(/\+/g, " ") },
+    { name: "decode-uri", value: safeDecodeURIComponent(signedUrl) },
+    { name: "plus-as-space-then-decode-uri", value: safeDecodeURIComponent(signedUrl.replace(/\+/g, " ")) }
+  ];
+
+  let matchedCandidate = null;
+  let expectedHash = null;
   try {
-    expectedHash = await hmacSha1Hex(
-      new TextEncoder().encode(String(env.BITLABS_SECRET_KEY)),
-      signedUrl
-    );
+    for (const candidate of candidates) {
+      const candidateHash = await hmacSha1Hex(
+        new TextEncoder().encode(String(env.BITLABS_SECRET_KEY)),
+        candidate.value
+      );
+      if (!expectedHash) expectedHash = candidateHash;
+      if (constantTimeEqual(suppliedHash, candidateHash)) {
+        matchedCandidate = candidate.name;
+        expectedHash = candidateHash;
+        break;
+      }
+    }
   } catch (e) {
     console.error("BitLabs callback: HMAC calculation error", e);
     return bitlabsCallbackResponse("HMAC_ERROR", 500);
   }
 
-  if (!constantTimeEqual(suppliedHash, expectedHash)) {
+  if (!matchedCandidate) {
     console.error("BitLabs callback: invalid hash", {
       hashLength: suppliedHash.length,
-      expectedLength: expectedHash.length
+      expectedLength: expectedHash?.length || 0,
+      suppliedPrefix: suppliedHash.slice(0, 8),
+      rawExpectedPrefix: expectedHash?.slice(0, 8) || "",
+      signedUrlSha256: await sha256Hex(signedUrl),
+      candidateNames: candidates.map(c => c.name)
     });
     return bitlabsCallbackResponse("INVALID_HASH", 403, {
       hashLength: suppliedHash.length,
-      expectedLength: expectedHash.length
+      expectedLength: expectedHash?.length || 0,
+      suppliedPrefix: suppliedHash.slice(0, 8),
+      rawExpectedPrefix: expectedHash?.slice(0, 8) || "",
+      signedUrlSha256: await sha256Hex(signedUrl),
+      candidateMatches: []
+    });
+  }
+
+  if (matchedCandidate !== "raw") {
+    console.warn("BitLabs callback: hash matched normalized tester URL", {
+      matchedCandidate,
+      signedUrlSha256: await sha256Hex(signedUrl)
     });
   }
 
