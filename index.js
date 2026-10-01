@@ -1101,21 +1101,29 @@ async function bitlabsPostback(request, env) {
   // only, we also test equivalent URL representations because its displayed
   // callback can differ from the HTTP-serialized query string (e.g. + vs space
   // or percent-encoding). We never use these variants unless their HMAC matches.
+  const secret = String(env.BITLABS_SECRET_KEY);
   const candidates = [
     { name: "raw", value: signedUrl },
+    { name: "raw-without-debug", value: signedUrl.replace(/&debug=true$/i, "") },
     { name: "plus-as-space", value: signedUrl.replace(/\+/g, " ") },
     { name: "decode-uri", value: safeDecodeURIComponent(signedUrl) },
-    { name: "plus-as-space-then-decode-uri", value: safeDecodeURIComponent(signedUrl.replace(/\+/g, " ")) }
+    { name: "plus-as-space-then-decode-uri", value: safeDecodeURIComponent(signedUrl.replace(/\+/g, " ")) },
+    { name: "path-query-raw", value: new URL(request.url).pathname + new URL(request.url).search.split("&hash=")[0] },
+    { name: "query-raw", value: "?" + signedUrl.split("?", 2)[1] },
+    { name: "query-decoded", value: "?" + safeDecodeURIComponent(signedUrl.split("?", 2)[1] || "") },
+    { name: "query-plus-space-decoded", value: "?" + safeDecodeURIComponent((signedUrl.split("?", 2)[1] || "").replace(/\+/g, " ")) }
   ];
 
   let matchedCandidate = null;
   let expectedHash = null;
+  const candidateDiagnostics = [];
   try {
     for (const candidate of candidates) {
       const candidateHash = await hmacSha1Hex(
-        new TextEncoder().encode(String(env.BITLABS_SECRET_KEY)),
+        new TextEncoder().encode(secret),
         candidate.value
       );
+      candidateDiagnostics.push({ name: candidate.name, prefix: candidateHash.slice(0, 8) });
       if (!expectedHash) expectedHash = candidateHash;
       if (constantTimeEqual(suppliedHash, candidateHash)) {
         matchedCandidate = candidate.name;
@@ -1135,7 +1143,10 @@ async function bitlabsPostback(request, env) {
       suppliedPrefix: suppliedHash.slice(0, 8),
       rawExpectedPrefix: expectedHash?.slice(0, 8) || "",
       signedUrlSha256: await sha256Hex(signedUrl),
-      candidateNames: candidates.map(c => c.name)
+      candidateNames: candidates.map(c => c.name),
+      candidateDiagnostics,
+      secretLength: secret.length,
+      secretSha256: await sha256Hex(secret)
     });
     return bitlabsCallbackResponse("INVALID_HASH", 403, {
       hashLength: suppliedHash.length,
@@ -1143,7 +1154,10 @@ async function bitlabsPostback(request, env) {
       suppliedPrefix: suppliedHash.slice(0, 8),
       rawExpectedPrefix: expectedHash?.slice(0, 8) || "",
       signedUrlSha256: await sha256Hex(signedUrl),
-      candidateMatches: []
+      candidateMatches: [],
+      candidateDiagnostics,
+      secretLength: secret.length,
+      secretSha256: await sha256Hex(secret)
     });
   }
 
