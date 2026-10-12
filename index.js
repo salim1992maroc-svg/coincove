@@ -2289,7 +2289,7 @@ async function boot(){
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 </script>
-<footer class="legal-footer" style="padding:18px 16px 100px;text-align:center;color:var(--muted);font-size:13px;border-top:1px solid var(--line);margin-top:18px">
+<footer class="legal-footer" style="position:fixed;left:0;right:0;bottom:82px;z-index:40;padding:10px 12px;text-align:center;color:var(--muted);font-size:13px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:rgba(7,11,24,.96);backdrop-filter:blur(12px);margin:0">
   <a href="/privacy" style="color:var(--cyan);text-decoration:none;margin:0 10px">Privacy Policy</a>
   <span aria-hidden="true">·</span>
   <a href="/terms" style="color:var(--cyan);text-decoration:none;margin:0 10px">Terms of Service</a>
@@ -2369,3 +2369,34 @@ function renderLegalPage(kind) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0f172a"><title>${title} — Coin Cove</title><style>:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f7ff;background:#070b18;--line:rgba(155,180,255,.14)}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 10% 0%,rgba(62,93,214,.24),transparent 35%),radial-gradient(ellipse at 100% 25%,rgba(30,204,188,.12),transparent 30%),linear-gradient(160deg,#080d1d,#0a1022 52%,#070b17);color:#f4f7ff}.legal-page{max-width:820px;margin:0 auto;padding:24px 16px 48px}.legal-card{background:linear-gradient(145deg,rgba(19,29,53,.97),rgba(12,19,37,.98));border:1px solid var(--line);border-radius:24px;padding:clamp(20px,4vw,34px);box-shadow:0 18px 45px rgba(0,0,0,.22)}a{color:#7df2dc;text-decoration:none;font-weight:800}.brand{font-weight:950;font-size:21px}.legal-page h1{font-size:clamp(28px,6vw,38px);margin:14px 0 6px;letter-spacing:-1px}.legal-page h2{font-size:18px;margin:25px 0 8px}.legal-page p,.legal-page li{color:#c0cbe2;line-height:1.75;font-size:14px}.legal-date{color:#8e9bb8;font-size:12px}.legal-page ul{padding-left:22px}.links{display:flex;gap:16px;flex-wrap:wrap;margin-top:26px;padding-top:18px;border-top:1px solid var(--line)}</style></head><body><main class="legal-page"><a class="legal-back" href="/">← Back to Coin Cove</a><section class="legal-card"><div class="brand">🌊 Coin Cove</div><h1>${title}</h1><div class="legal-date">Last updated: October 12, 2026</div>${body}<div class="links"><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a><a href="/">Coin Cove Home</a></div></section></main></body></html>`;
 }
 
+async function api(p,o={}){
+ const headers=Object.assign({'Content-Type':'application/json'},o.headers||{},token?{'Authorization':'Bearer '+token}:{});
+ const controller=new AbortController();
+ const timeout=setTimeout(()=>controller.abort(),15000);
+ try{
+   const r=await fetch(p,Object.assign({},o,{headers,signal:controller.signal}));
+   let d;try{d=await r.json()}catch{d={success:false,message:'Server response was invalid.'}}
+   if(!r.ok&&!d.message)d.message='Request failed ('+r.status+').';
+   return d;
+ }catch(e){
+   return {success:false,code:e?.name==='AbortError'?'TIMEOUT':'NETWORK_ERROR',message:e?.name==='AbortError'?'The server took too long to respond.':'Unable to connect to the server.'};
+ }finally{clearTimeout(timeout)}
+}
+async function boot(){
+ try{
+   const m=await api('/api/admin/me');
+   if(!m.success){login();return}
+   dash();
+ }catch(e){
+   document.getElementById('app').innerHTML='<div class="card"><h2>Unable to load Admin</h2><p>'+esc(e?.message||'Unexpected error.')+'</p><button class="btn" onclick="location.reload()">Retry</button></div>';
+ }
+}
+function login(){document.getElementById('app').innerHTML='<div class="card"><h2>Coin Cove Admin</h2><input id="adminUser" class="input" placeholder="Admin Username" autocomplete="username"><input id="adminPass" class="input" type="password" placeholder="Admin Password" autocomplete="current-password"><button class="btn" style="margin-top:10px" onclick="doLogin()">Login</button></div>'}
+async function doLogin(){const username=document.getElementById('adminUser')?.value.trim()||'';const password=document.getElementById('adminPass')?.value||'';if(!username||!password){alert('Enter admin username and password.');return}const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username,password})});if(!d.success)return alert(d.message||'Admin login failed.');token=d.token;storage.set('cc_admin_token',token);dash()}
+async function dash(){const [us,ws]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals')]);if(!us.success||!ws.success){document.getElementById('app').innerHTML='<div class="card"><h2>Admin data could not be loaded</h2><p>'+esc(us.message||ws.message||'Please try again.')+'</p><button class="btn" onclick="dash()">Retry</button><button class="btn secondary" style="margin-top:8px" onclick="logout()">Back to login</button></div>';return}document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Telegram Bot</h3><p>Connect the bot webhook so /start opens Coin Cove in Telegram.</p><button class="btn" onclick="setupTelegram()">Connect Telegram Bot</button><span id="tgSetupStatus" class="small" style="margin-left:8px"></span></div><div class="card"><h3>Users</h3><table><tr><th>ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(Number(x.usd_cents||0)/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\'approve\')">Approve</button> <button class="btn danger" onclick="act('+x.id+',\'reject\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}
+async function setupTelegram(){const el=document.getElementById('tgSetupStatus');if(el)el.textContent='Connecting...';const d=await api('/api/admin/telegram/setup',{method:'POST'});if(el)el.textContent=d.success?'Connected':'Failed';alert(d.message||d.description||(d.success?'Telegram webhook connected.':'Telegram setup failed.'));}
+async function act(id,a){const d=await api('/api/admin/withdrawal',{method:'POST',body:JSON.stringify({id,action:a})});alert(d.message||'Done');dash()}
+async function logout(){await api('/api/admin/logout',{method:'POST'});storage.remove('cc_admin_token');token='';login()}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
+</script></body></html>`;
+}
