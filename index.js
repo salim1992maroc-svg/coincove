@@ -22,6 +22,7 @@ const CPIDROID_PLACEMENT = "yxpm-81812-kal5";
 const OFFERWALL_GG_PUBLIC_KEY = "4c826098db679c99583194371d0eae1b";
 const ADSWED_PUBLIC_KEY = "eJjhGO9M";
 const OFFERME_PUBLIC_KEY = "5bXp8NOHWINp4PkGRsKynKJ7Ext3g4";
+const UPWALL_PLACEMENT_NAME = "Coin Cove - Upwall";
 const BITLABS_APP_TOKEN = "0bd8ff38-7c10-44a7-87be-3e16f8d5c47c";
 // Keep the AdswedMedia secret in the Cloudflare Worker secret named ADSWED_SECRET_KEY.
 
@@ -54,6 +55,7 @@ export default {
       if (url.pathname === "/api/offerwall/admantum/postback") return admantumPostback(request, env);
       if (url.pathname === "/api/offerwall/adswed/postback") return adswedPostback(request, env);
       if (url.pathname === "/api/offerwall/bitlabs/postback") return bitlabsPostback(request, env);
+      if (url.pathname === "/api/offerwall/upwall/postback") return upwallPostback(request, env);
       if (url.pathname === "/api/offerme/postback") return offermePostback(request, env);
       if (url.pathname === "/api/offerme/launch") return offermeLaunch(request, env);
       if (url.pathname === "/postback/gaintwall") return gaintwallPostback(request, env);
@@ -393,6 +395,85 @@ async function adswedPostback(request, env) {
     return new Response("server error", { status: 500 });
   }
 
+  return new Response("OK", { status: 200 });
+}
+
+async function upwallPostback(request, env) {
+  if (!["GET", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
+  if (!env.DB || !env.UPWALL_POSTBACK_PASSWORD) return new Response("server configuration error", { status: 500 });
+  await ensureSchema(env);
+
+  const q = await readPostbackParams(request);
+  const userId = (q.get("userid") || "").trim();
+  const suppliedPassword = (q.get("password") || "").trim();
+  const rawReward = q.get("user_amount");
+  const tx = (q.get("transactionID") || q.get("transaction_id") || "").trim();
+  const offerId = (q.get("offer_id") || "").trim();
+  const offerName = (q.get("offer_name") || "Upwall offer").trim();
+  const payoutRaw = q.get("payout") || "0";
+  const payout = Number(payoutRaw);
+
+  if (!userId || !suppliedPassword || rawReward === null || !tx) {
+    return new Response("bad request", { status: 400 });
+  }
+  if (!constantTimeEqual(suppliedPassword, String(env.UPWALL_POSTBACK_PASSWORD))) {
+    return new Response("invalid password", { status: 403 });
+  }
+  if (!Number.isFinite(payout)) return new Response("invalid payout", { status: 400 });
+
+  const user = await dbUserByDatabaseId(env.DB, userId);
+  if (!user) return new Response("unknown user", { status: 404 });
+
+  const transactionId = "upwall:" + tx;
+  const now = Math.floor(Date.now() / 1000);
+
+  // Upwall documents negative payout values for reversed leads.
+  if (payout < 0) {
+    const original = await env.DB.prepare(
+      "SELECT user_id,amount,status FROM offerwall_conversions WHERE transaction_id=? LIMIT 1"
+    ).bind(transactionId).first();
+    if (!original || String(original.status).toLowerCase() === "reversed") {
+      return new Response("OK", { status: 200 });
+    }
+    const reversal = -Math.abs(Number(original.amount));
+    try {
+      await env.DB.batch([
+        env.DB.prepare("UPDATE offerwall_conversions SET status='reversed' WHERE transaction_id=?").bind(transactionId),
+        env.DB.prepare("UPDATE wallets SET balance=MAX(0,balance+?),updated_at=? WHERE user_id=?")
+          .bind(reversal, now, original.user_id),
+        env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
+          .bind(original.user_id, "upwall_offer_reversal", reversal, "Upwall offer reversal", now)
+      ]);
+    } catch (e) {
+      console.error("Upwall reversal error:", e);
+      return new Response("server error", { status: 500 });
+    }
+    return new Response("OK", { status: 200 });
+  }
+
+  const rewardNumber = Number(rawReward);
+  if (!Number.isFinite(rewardNumber) || rewardNumber <= 0) return new Response("invalid reward", { status: 400 });
+  const reward = Math.trunc(rewardNumber);
+  if (reward <= 0) return new Response("OK", { status: 200 });
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO offerwall_conversions
+        (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`)
+        .bind(transactionId, user.id, reward, "credited", offerId || null, offerName,
+          null, Math.max(0, payout), 0, now),
+      env.DB.prepare("UPDATE wallets SET balance=balance+?,lifetime_earned=lifetime_earned+?,updated_at=? WHERE user_id=?")
+        .bind(reward, reward, now, user.id),
+      env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
+        .bind(user.id, "upwall_offer_reward", reward, "Upwall offer reward", now)
+    ]);
+  } catch (e) {
+    const message = String(e?.message || e).toLowerCase();
+    if (message.includes("unique") || message.includes("constraint")) return new Response("OK", { status: 200 });
+    console.error("Upwall credit error:", e);
+    return new Response("server error", { status: 500 });
+  }
   return new Response("OK", { status: 200 });
 }
 
