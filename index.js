@@ -22,7 +22,6 @@ const CPIDROID_PLACEMENT = "yxpm-81812-kal5";
 const OFFERWALL_GG_PUBLIC_KEY = "4c826098db679c99583194371d0eae1b";
 const ADSWED_PUBLIC_KEY = "eJjhGO9M";
 const OFFERME_PUBLIC_KEY = "5bXp8NOHWINp4PkGRsKynKJ7Ext3g4";
-const UPWALL_PLACEMENT_NAME = "Coin Cove - Upwall";
 const BITLABS_APP_TOKEN = "0bd8ff38-7c10-44a7-87be-3e16f8d5c47c";
 // Keep the AdswedMedia secret in the Cloudflare Worker secret named ADSWED_SECRET_KEY.
 
@@ -31,13 +30,6 @@ export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
-      if (url.pathname === "/privacy") {
-        return new Response(renderLegalPage("privacy"), { headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store" } });
-      }
-      if (url.pathname === "/terms") {
-        return new Response(renderLegalPage("terms"), { headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store" } });
-      }
-
       if (url.pathname === "/api/health") {
         return json({
           success: true,
@@ -62,7 +54,6 @@ export default {
       if (url.pathname === "/api/offerwall/admantum/postback") return admantumPostback(request, env);
       if (url.pathname === "/api/offerwall/adswed/postback") return adswedPostback(request, env);
       if (url.pathname === "/api/offerwall/bitlabs/postback") return bitlabsPostback(request, env);
-      if (url.pathname === "/api/offerwall/upwall/postback") return upwallPostback(request, env);
       if (url.pathname === "/api/offerme/postback") return offermePostback(request, env);
       if (url.pathname === "/api/offerme/launch") return offermeLaunch(request, env);
       if (url.pathname === "/postback/gaintwall") return gaintwallPostback(request, env);
@@ -402,85 +393,6 @@ async function adswedPostback(request, env) {
     return new Response("server error", { status: 500 });
   }
 
-  return new Response("OK", { status: 200 });
-}
-
-async function upwallPostback(request, env) {
-  if (!["GET", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
-  if (!env.DB || !env.UPWALL_POSTBACK_PASSWORD) return new Response("server configuration error", { status: 500 });
-  await ensureSchema(env);
-
-  const q = await readPostbackParams(request);
-  const userId = (q.get("userid") || "").trim();
-  const suppliedPassword = (q.get("password") || "").trim();
-  const rawReward = q.get("user_amount");
-  const tx = (q.get("transactionID") || q.get("transaction_id") || "").trim();
-  const offerId = (q.get("offer_id") || "").trim();
-  const offerName = (q.get("offer_name") || "Upwall offer").trim();
-  const payoutRaw = q.get("payout") || "0";
-  const payout = Number(payoutRaw);
-
-  if (!userId || !suppliedPassword || rawReward === null || !tx) {
-    return new Response("bad request", { status: 400 });
-  }
-  if (!constantTimeEqual(suppliedPassword, String(env.UPWALL_POSTBACK_PASSWORD))) {
-    return new Response("invalid password", { status: 403 });
-  }
-  if (!Number.isFinite(payout)) return new Response("invalid payout", { status: 400 });
-
-  const user = await dbUserByDatabaseId(env.DB, userId);
-  if (!user) return new Response("unknown user", { status: 404 });
-
-  const transactionId = "upwall:" + tx;
-  const now = Math.floor(Date.now() / 1000);
-
-  // Upwall documents negative payout values for reversed leads.
-  if (payout < 0) {
-    const original = await env.DB.prepare(
-      "SELECT user_id,amount,status FROM offerwall_conversions WHERE transaction_id=? LIMIT 1"
-    ).bind(transactionId).first();
-    if (!original || String(original.status).toLowerCase() === "reversed") {
-      return new Response("OK", { status: 200 });
-    }
-    const reversal = -Math.abs(Number(original.amount));
-    try {
-      await env.DB.batch([
-        env.DB.prepare("UPDATE offerwall_conversions SET status='reversed' WHERE transaction_id=?").bind(transactionId),
-        env.DB.prepare("UPDATE wallets SET balance=MAX(0,balance+?),updated_at=? WHERE user_id=?")
-          .bind(reversal, now, original.user_id),
-        env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
-          .bind(original.user_id, "upwall_offer_reversal", reversal, "Upwall offer reversal", now)
-      ]);
-    } catch (e) {
-      console.error("Upwall reversal error:", e);
-      return new Response("server error", { status: 500 });
-    }
-    return new Response("OK", { status: 200 });
-  }
-
-  const rewardNumber = Number(rawReward);
-  if (!Number.isFinite(rewardNumber) || rewardNumber <= 0) return new Response("invalid reward", { status: 400 });
-  const reward = Math.trunc(rewardNumber);
-  if (reward <= 0) return new Response("OK", { status: 200 });
-
-  try {
-    await env.DB.batch([
-      env.DB.prepare(`INSERT INTO offerwall_conversions
-        (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?)`)
-        .bind(transactionId, user.id, reward, "credited", offerId || null, offerName,
-          null, Math.max(0, payout), 0, now),
-      env.DB.prepare("UPDATE wallets SET balance=balance+?,lifetime_earned=lifetime_earned+?,updated_at=? WHERE user_id=?")
-        .bind(reward, reward, now, user.id),
-      env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
-        .bind(user.id, "upwall_offer_reward", reward, "Upwall offer reward", now)
-    ]);
-  } catch (e) {
-    const message = String(e?.message || e).toLowerCase();
-    if (message.includes("unique") || message.includes("constraint")) return new Response("OK", { status: 200 });
-    console.error("Upwall credit error:", e);
-    return new Response("server error", { status: 500 });
-  }
   return new Response("OK", { status: 200 });
 }
 
@@ -2036,10 +1948,10 @@ button,input,select{font:inherit}button{cursor:pointer;transition:transform .18s
 .top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:2px 0 24px;padding:4px 2px}.brand{display:flex;align-items:center;gap:10px;font-weight:950;font-size:23px;letter-spacing:-.8px;color:#f7f9ff}.brand:first-letter{color:var(--cyan)}.top .brand{font-size:24px}.top .small{margin-top:5px;font-size:12px;letter-spacing:.3px;color:#8f9cba}.close{background:rgba(255,255,255,.055);color:#e9eeff;border:1px solid var(--line);border-radius:14px;padding:11px 15px;font-weight:750;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
 .card{position:relative;overflow:hidden;background:linear-gradient(145deg,rgba(19,29,53,.96),rgba(12,19,37,.97));border:1px solid var(--line);border-radius:27px;padding:22px;margin-bottom:17px;box-shadow:0 18px 45px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.035);backdrop-filter:blur(16px)}.card h2,.card h3{letter-spacing:-.5px}.wrap>.card:nth-of-type(2){min-height:270px;padding:25px;background:radial-gradient(ellipse at 100% 0%,rgba(69,240,208,.19),transparent 42%),radial-gradient(ellipse at 0% 100%,rgba(91,140,255,.2),transparent 48%),linear-gradient(135deg,#17284a 0%,#121b35 58%,#19162f 100%);border:1px solid rgba(111,207,255,.24);box-shadow:0 24px 60px rgba(0,0,0,.3),inset 0 1px 0 rgba(255,255,255,.08)}.wrap>.card:nth-of-type(2):after{content:"C";position:absolute;right:-10px;top:-65px;font-size:245px;line-height:1;font-weight:1000;color:rgba(255,255,255,.025);pointer-events:none;transform:rotate(-12deg)}.wrap>.card:nth-of-type(2)>.small:first-child{font-size:13px;text-transform:uppercase;letter-spacing:1.8px;font-weight:800;color:#a9badc}.balance{position:relative;font-size:clamp(42px,10vw,61px);font-weight:950;letter-spacing:-2.5px;line-height:1.12;margin:13px 0 10px;background:linear-gradient(100deg,#fff 15%,#b9fff1 72%,#9abaff);-webkit-background-clip:text;background-clip:text;color:transparent;z-index:1}.balance+.small{font-weight:700;color:#a8badc}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.stat{position:relative;padding:16px;border-radius:19px;background:rgba(7,13,29,.42);border:1px solid rgba(180,200,255,.12);backdrop-filter:blur(10px)}.stat .small{font-size:12px;letter-spacing:.2px}.stat b{display:block;font-size:23px;margin-top:7px;color:#f7f9ff;letter-spacing:-.5px}
 .title{font-size:20px;font-weight:900;letter-spacing:-.6px;margin-bottom:17px;display:flex;align-items:center;gap:9px}.actions{display:grid;gap:12px}.btn{position:relative;overflow:hidden;border:0;border-radius:17px;padding:16px 18px;font-weight:850;font-size:15px;letter-spacing:.05px;background:linear-gradient(110deg,#36e0c4,#54b8ff 55%,#8a78ff);color:#071427;width:100%;box-shadow:0 8px 24px rgba(72,177,255,.15),inset 0 1px 0 rgba(255,255,255,.28)}.btn:before{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 20%,rgba(255,255,255,.18),transparent 80%);transform:translateX(-100%);transition:transform .5s}.btn:hover:before{transform:translateX(100%)}.btn.secondary{background:linear-gradient(135deg,#1b2947,#182139);color:#e9efff;border:1px solid rgba(151,177,255,.16);box-shadow:none}.btn.good{background:linear-gradient(110deg,#36e0ad,#7ce98e);color:#06251e;box-shadow:0 8px 24px rgba(54,224,173,.12)}.btn.warn{background:linear-gradient(110deg,#ffc86b,#ff9c60);color:#301707}.btn.danger{background:linear-gradient(110deg,#ff7b91,#ef4566);color:#fff}.row{display:flex;gap:12px;align-items:center}.row>*{flex:1}.input,.select{width:100%;background:#0a1224;color:#f4f7ff;border:1px solid rgba(157,181,255,.2);border-radius:15px;padding:15px;outline:none;transition:border .2s,box-shadow .2s}.input:focus,.select:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(69,240,208,.1)}.input::placeholder{color:#71809f}
-.modal{position:fixed;inset:0;background:rgba(2,5,14,.78);z-index:20;display:flex;align-items:flex-end;backdrop-filter:blur(8px)}.sheet{width:100%;max-height:90vh;overflow:auto;background:linear-gradient(160deg,#131e36,#0b1122);border:1px solid var(--line);border-bottom:0;border-radius:28px 28px 0 0;padding:22px}.close-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}.offer{padding:19px;border:1px solid rgba(147,173,255,.15);border-radius:20px;background:linear-gradient(135deg,rgba(27,40,69,.9),rgba(15,23,43,.96));color:#f4f7ff;text-align:left;box-shadow:0 8px 20px rgba(0,0,0,.12);transition:transform .2s,border-color .2s}.offer:hover{transform:translateY(-2px);border-color:rgba(69,240,208,.42)}.offer strong{display:block;margin-bottom:7px;font-size:16px}.offer .small{font-size:12px;line-height:1.5}
-.nav{position:fixed;left:0;right:0;bottom:0;padding-bottom:env(safe-area-inset-bottom);background:rgba(6,10,22,.88);backdrop-filter:blur(24px);border-top:1px solid rgba(157,181,255,.13);z-index:10;box-shadow:0 -12px 35px rgba(0,0,0,.18)}.navin{max-width:760px;width:100%;margin:auto;display:grid;grid-template-columns:repeat(4,1fr);gap:7px;padding:10px 12px 9px}.nav button{background:transparent;color:#7785a5;border:1px solid transparent;border-radius:17px;padding:10px 4px;font-size:12px;font-weight:800;line-height:1.65}.nav button.active{color:#54f0d2;background:linear-gradient(135deg,rgba(69,240,208,.13),rgba(91,140,255,.1));border-color:rgba(69,240,208,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}.notice{padding:15px 16px;border-radius:17px;background:rgba(69,240,208,.06);border:1px solid rgba(69,240,208,.13);color:#b7c6e5;font-size:13px;line-height:1.6}.muted{color:var(--muted)}.small{font-size:13px;color:var(--muted);line-height:1.5}.hidden{display:none!important}h2,h3{margin:0 0 12px}.error-card{text-align:center}.error-card h3{margin-top:0}.error-card .btn{margin-top:16px}.legal-links{position:relative;z-index:1;text-align:center;padding:10px 12px 20px;color:#8e9bb8;font-size:12px}.legal-links a{color:#a9c3ff;text-decoration:none;margin:0 9px}.legal-links a:hover{text-decoration:underline}.legal-page{position:relative;z-index:1;max-width:820px;margin:0 auto;padding:24px 16px 48px}.legal-page .legal-card{background:linear-gradient(145deg,rgba(19,29,53,.97),rgba(12,19,37,.98));border:1px solid var(--line);border-radius:24px;padding:clamp(20px,4vw,34px);box-shadow:0 18px 45px rgba(0,0,0,.22)}.legal-page h1{font-size:clamp(28px,6vw,38px);margin:8px 0 6px;letter-spacing:-1px}.legal-page h2{font-size:18px;margin:25px 0 8px}.legal-page p,.legal-page li{color:#c0cbe2;line-height:1.75;font-size:14px}.legal-page .legal-back{display:inline-block;margin-bottom:16px;color:#7df2dc;text-decoration:none;font-weight:800}.legal-page .legal-date{color:#8e9bb8;font-size:12px}.legal-page ul{padding-left:22px}
+.modal{position:fixed;inset:0;background:rgba(2,5,14,.78);z-index:20;display:flex;align-items:flex-end;backdrop-filter:blur(8px)}.sheet{width:100%;max-height:90vh;overflow:auto;background:linear-gradient(160deg,#131e36,#0b1122);border:1px solid var(--line);border-bottom:0;border-radius:28px 28px 0 0;padding:22px}.close-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}.offer{padding:19px;border:1px solid rgba(147,173,255,.15);border-radius:20px;background:linear-gradient(135deg,rgba(27,40,69,.9),rgba(15,23,43,.96));color:#f4f7ff;text-align:left;box-shadow:0 8px 20px rgba(0,0,0,.12);transition:transform .2s,border-color .2s}.offer:hover{transform:translateY(-2px);border-color:rgba(69,240,208,.42)}.offer strong{display:block;margin-bottom:7px;font-size:16px}.offer .small{font-size:12px;line-height:1.5}.offer-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.offer-grid .offer{width:100%;min-width:0;min-height:190px;aspect-ratio:1/1;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;padding:20px;border-radius:23px;text-align:left;background:radial-gradient(circle at 100% 0%,rgba(69,240,208,.13),transparent 48%),linear-gradient(145deg,rgba(27,40,69,.98),rgba(12,20,39,.99));box-shadow:0 12px 26px rgba(0,0,0,.18),inset 0 1px 0 rgba(255,255,255,.04)}.offer-grid .offer strong{font-size:18px;line-height:1.35;margin:12px 0 8px;overflow-wrap:anywhere}.offer-grid .offer strong:first-letter{font-size:25px}.offer-grid .offer .small{font-size:12px;line-height:1.5}.offer-grid .offer:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+.nav{position:fixed;left:0;right:0;bottom:0;padding-bottom:env(safe-area-inset-bottom);background:rgba(6,10,22,.88);backdrop-filter:blur(24px);border-top:1px solid rgba(157,181,255,.13);z-index:10;box-shadow:0 -12px 35px rgba(0,0,0,.18)}.navin{max-width:760px;width:100%;margin:auto;display:grid;grid-template-columns:repeat(4,1fr);gap:7px;padding:10px 12px 9px}.nav button{background:transparent;color:#7785a5;border:1px solid transparent;border-radius:17px;padding:10px 4px;font-size:12px;font-weight:800;line-height:1.65}.nav button.active{color:#54f0d2;background:linear-gradient(135deg,rgba(69,240,208,.13),rgba(91,140,255,.1));border-color:rgba(69,240,208,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}.notice{padding:15px 16px;border-radius:17px;background:rgba(69,240,208,.06);border:1px solid rgba(69,240,208,.13);color:#b7c6e5;font-size:13px;line-height:1.6}.muted{color:var(--muted)}.small{font-size:13px;color:var(--muted);line-height:1.5}.hidden{display:none!important}h2,h3{margin:0 0 12px}.error-card{text-align:center}.error-card h3{margin-top:0}.error-card .btn{margin-top:16px}
 @media(min-width:600px){.wrap{padding-top:32px}.wrap>.card:nth-of-type(2){padding:32px}.actions{gap:14px}.navin{padding:12px 18px}}
-@media(max-width:430px){.wrap{padding:15px 12px calc(105px + env(safe-area-inset-bottom))}.top{margin-bottom:18px}.brand,.top .brand{font-size:21px}.card{padding:18px;border-radius:23px;margin-bottom:13px}.wrap>.card:nth-of-type(2){padding:21px;min-height:250px}.balance{font-size:39px;letter-spacing:-1.8px}.stat{padding:13px;border-radius:16px}.stat b{font-size:20px}.title{font-size:18px;margin-bottom:15px}.btn{padding:15px 13px;font-size:14px}.navin{gap:4px;padding:8px 8px 7px}.nav button{font-size:11px;border-radius:14px}.offer{padding:16px}}
+@media(max-width:430px){.offer-grid{gap:10px}.offer-grid .offer{min-height:158px;padding:14px;border-radius:19px}.offer-grid .offer strong{font-size:16px;margin:10px 0 7px}.offer-grid .offer .small{font-size:11px}.wrap{padding:15px 12px calc(105px + env(safe-area-inset-bottom))}.top{margin-bottom:18px}.brand,.top .brand{font-size:21px}.card{padding:18px;border-radius:23px;margin-bottom:13px}.wrap>.card:nth-of-type(2){padding:21px;min-height:250px}.balance{font-size:39px;letter-spacing:-1.8px}.stat{padding:13px;border-radius:16px}.stat b{font-size:20px}.title{font-size:18px;margin-bottom:15px}.btn{padding:15px 13px;font-size:14px}.navin{gap:4px;padding:8px 8px 7px}.nav button{font-size:11px;border-radius:14px}.offer{padding:16px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 </style>
 </head>
@@ -2097,7 +2009,6 @@ function render(){
   '<div class="wrap">'+
     '<div class="top"><div><div class="brand">🌊 Coin Cove</div><div class="small">Earn Coins and withdraw</div></div><button class="close" onclick="logout()">Log out</button></div>'+
     (page==='home'?homePage(balance):page==='offers'?offersPage():page==='withdraw'?withdrawPage(balance):accountPage())+
-    '<div class="legal-links"><a href="/privacy" target="_blank" rel="noopener">Privacy Policy</a><a href="/terms" target="_blank" rel="noopener">Terms of Service</a></div>'+
   '</div>'+
   '<div class="nav"><div class="navin">'+
     '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">🏠<br>Home</button>'+
@@ -2124,7 +2035,7 @@ function txHtml(){
 }
 function offersPage(){
  return '<div class="card"><h2>Offerwalls</h2><div class="notice">Complete eligible offers. Rewards are credited by each provider after its server callback is received.</div></div>'+
- '<div class="card"><div class="actions">'+
+ '<div class="card"><div class="offer-grid">'+
  '<button class="offer" onclick="showTapjoy()"><strong>⚡ Tapjoy</strong><span class="small">Open Tapjoy Web Offerwall</span></button>'+
  '<button class="offer" onclick="openProvider(\'cpidroid\')"><strong>🎯 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'notik\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
@@ -2234,10 +2145,10 @@ async function reload(){
 function loginScreen(){
  const app=document.getElementById('app');
  if(tg&&tg.initData){
-   app.innerHTML='<div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">🌊 Coin Cove</div><h2>Telegram account</h2><p class="muted">This Mini App uses your Telegram account. Email/password login is disabled here.</p><div class="notice">If Telegram authorization is unavailable, close and reopen Coin Cove from <b>@Covecoinbot</b>.</div><button class="btn" style="margin-top:12px" onclick="location.reload()">Retry Telegram login</button></div><div class="legal-links"><a href="/privacy" target="_blank" rel="noopener">Privacy Policy</a><a href="/terms" target="_blank" rel="noopener">Terms of Service</a></div></div>';
+   app.innerHTML='<div class="wrap"><div class="card" style="margin-top:8vh"><div class="brand">🌊 Coin Cove</div><h2>Telegram account</h2><p class="muted">This Mini App uses your Telegram account. Email/password login is disabled here.</p><div class="notice">If Telegram authorization is unavailable, close and reopen Coin Cove from <b>@Covecoinbot</b>.</div><button class="btn" style="margin-top:12px" onclick="location.reload()">Retry Telegram login</button></div></div>';
    return;
  }
- app.innerHTML='<div class="wrap"><div class="card" style="margin-top:12vh"><div class="brand">🌊 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div id="authbox"><div class="actions"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div><div class="legal-links"><a href="/privacy" target="_blank" rel="noopener">Privacy Policy</a><a href="/terms" target="_blank" rel="noopener">Terms of Service</a></div></div>';
+ app.innerHTML='<div class="wrap"><div class="card" style="margin-top:12vh"><div class="brand">🌊 Coin Cove</div><p class="muted">Sign in to earn Coins and request withdrawals.</p><div id="authbox"><div class="actions"><input id="le" class="input" type="email" placeholder="Email" autocomplete="email"><input id="lp" class="input" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" onclick="doLogin()">Login</button><button class="btn secondary" onclick="showRegister()">Create account</button></div></div></div></div>';
 }
 function showRegister(){
  document.getElementById('authbox').innerHTML='<div class="actions"><input id="re" class="input" type="email" placeholder="Email"><input id="rp" class="input" type="password" placeholder="Password (8+ characters)"><input id="rc" class="input" type="password" placeholder="Confirm password"><button class="btn" onclick="doRegister()">Create account</button><button class="btn secondary" onclick="loginScreen()">Back to login</button></div>';
@@ -2292,35 +2203,6 @@ async function boot(){
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 </script>
 </body></html>`;
-}
-
-function renderLegalPage(kind) {
-  const privacy = kind === "privacy";
-  const title = privacy ? "Privacy Policy" : "Terms of Service";
-  const body = privacy ? `
-    <p>This Privacy Policy explains how Coin Cove ("Coin Cove", "we", "us") handles information when you use our website or Telegram Mini App. Use Coin Cove only if you agree with this policy.</p>
-    <h2>Information we may process</h2><ul>
-      <li><b>Account details:</b> email address for website accounts, and Telegram account identifiers and profile details made available to the Mini App.</li>
-      <li><b>Account activity:</b> Coin balances, rewards, offer completion records, referral activity, transaction history, and withdrawal requests.</li>
-      <li><b>Withdrawal details:</b> the payment method and destination you submit when requesting a withdrawal.</li>
-      <li><b>Technical and security data:</b> information included in requests or provider callbacks that is needed to operate the service, prevent abuse, and troubleshoot errors.</li></ul>
-    <h2>How we use information</h2><p>We use this information to create and secure accounts, display balances, record rewards and reversals, process withdrawal requests, provide support, detect fraud or duplicate activity, and operate and improve Coin Cove.</p>
-    <h2>Offerwalls and advertising partners</h2><p>When you open an offerwall or interact with an advertisement, the relevant third-party provider may receive identifiers and activity data needed to attribute offers, measure events, apply its own rules, and validate rewards. Those providers process data under their own privacy policies. Coin Cove cannot control the independent practices of third-party services.</p>
-    <h2>Sharing and disclosure</h2><p>We may share the minimum information needed with offerwall, advertising, hosting, database, and payment-related service providers to operate Coin Cove; and when reasonably necessary to protect users, investigate abuse, enforce our terms, or comply with applicable law. We do not intend to sell personal information.</p>
-    <h2>Storage and security</h2><p>Account and transaction records may be stored in our service database. On website login, a session token may be stored in your browser's local storage so you can remain signed in. We use reasonable measures intended to protect information, but no internet service or storage system can be guaranteed completely secure.</p>
-    <h2>Retention and your choices</h2><p>We retain information for as long as reasonably needed to operate accounts, maintain transaction records, resolve disputes, prevent fraud, and meet legal or provider requirements. You can stop using Coin Cove at any time. To ask about access, correction, or deletion, contact Coin Cove through its official support channel; some records may need to be retained for legitimate operational or legal reasons.</p>
-    <h2>Children and changes</h2><p>Coin Cove is not intended for people who are not legally permitted to use the service or the relevant third-party offers. We may update this policy when the service or applicable requirements change. The latest version will be published on this page.</p>
-  ` : `
-    <p>These Terms of Service govern your use of Coin Cove (the website and Telegram Mini App). By accessing or using Coin Cove, you agree to these terms. If you do not agree, do not use the service.</p>
-    <h2>Using Coin Cove</h2><p>You must provide accurate information, protect your login credentials, and use Coin Cove lawfully. You are responsible for activity performed through your account. Do not impersonate others, exploit bugs, interfere with the service, or use bots, fake accounts, misleading information, or other fraudulent methods to obtain rewards.</p>
-    <h2>Offers and rewards</h2><p>Coins are in-platform reward units, not a bank deposit, investment, or guaranteed cash value. Offer availability, eligibility, completion rules, and approval are controlled in part by third-party offerwall and advertising providers. A displayed offer or pending action does not guarantee a reward. Rewards may be delayed, rejected, corrected, or reversed if a provider reports an invalid, duplicate, cancelled, or chargeback event.</p>
-    <h2>Withdrawals</h2><p>Withdrawal requests are subject to the minimums, methods, limits, review process, and availability displayed in Coin Cove at the time of the request. You must provide a correct destination and use a payment method you are authorized to use. Submitting a request does not guarantee approval or a specific processing time. We may pause or reject requests where required information is missing or suspicious activity is detected.</p>
-    <h2>Third-party services</h2><p>Coin Cove may link to or display third-party offerwalls, advertisements, and services. Those services may have separate terms and privacy policies. We are not responsible for third-party content, availability, offer decisions, or their independent services.</p>
-    <h2>Suspension and changes</h2><p>We may investigate suspicious activity, withhold disputed rewards, limit features, or suspend accounts where we reasonably believe these terms have been violated or where needed to protect Coin Cove and its users. We may change or discontinue features and update these terms. Continued use after an update means you accept the updated terms.</p>
-    <h2>Availability and liability</h2><p>Coin Cove is provided on an "as available" basis. We do not guarantee uninterrupted access, continuous offer availability, or that every provider callback will be immediate. To the extent permitted by applicable law, Coin Cove is not liable for indirect losses arising from third-party services, provider decisions, outages, or unauthorized activity outside our reasonable control.</p>
-    <h2>Contact</h2><p>For questions about these terms, contact Coin Cove through its official support channel.</p>
-  `;
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0f172a"><title>${title} — Coin Cove</title><style>:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f7ff;background:#070b18;--line:rgba(155,180,255,.14)}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 10% 0%,rgba(62,93,214,.24),transparent 35%),radial-gradient(ellipse at 100% 25%,rgba(30,204,188,.12),transparent 30%),linear-gradient(160deg,#080d1d,#0a1022 52%,#070b17);color:#f4f7ff}.legal-page{max-width:820px;margin:0 auto;padding:24px 16px 48px}.legal-card{background:linear-gradient(145deg,rgba(19,29,53,.97),rgba(12,19,37,.98));border:1px solid var(--line);border-radius:24px;padding:clamp(20px,4vw,34px);box-shadow:0 18px 45px rgba(0,0,0,.22)}a{color:#7df2dc;text-decoration:none;font-weight:800}.brand{font-weight:950;font-size:21px}.legal-page h1{font-size:clamp(28px,6vw,38px);margin:14px 0 6px;letter-spacing:-1px}.legal-page h2{font-size:18px;margin:25px 0 8px}.legal-page p,.legal-page li{color:#c0cbe2;line-height:1.75;font-size:14px}.legal-date{color:#8e9bb8;font-size:12px}.legal-page ul{padding-left:22px}.links{display:flex;gap:16px;flex-wrap:wrap;margin-top:26px;padding-top:18px;border-top:1px solid var(--line)}</style></head><body><main class="legal-page"><a class="legal-back" href="/">← Back to Coin Cove</a><section class="legal-card"><div class="brand">🌊 Coin Cove</div><h1>${title}</h1><div class="legal-date">Last updated: October 12, 2026</div>${body}<div class="links"><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a><a href="/">Coin Cove Home</a></div></section></main></body></html>`;
 }
 
 function renderAdmin() {
