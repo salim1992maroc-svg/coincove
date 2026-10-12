@@ -30,6 +30,12 @@ export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
+      if (url.pathname === "/privacy") {
+        return new Response(renderLegalPage("privacy"), { headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store" } });
+      }
+      if (url.pathname === "/terms") {
+        return new Response(renderLegalPage("terms"), { headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store" } });
+      }
       if (url.pathname === "/api/health") {
         return json({
           success: true,
@@ -54,6 +60,7 @@ export default {
       if (url.pathname === "/api/offerwall/admantum/postback") return admantumPostback(request, env);
       if (url.pathname === "/api/offerwall/adswed/postback") return adswedPostback(request, env);
       if (url.pathname === "/api/offerwall/bitlabs/postback") return bitlabsPostback(request, env);
+      if (url.pathname === "/api/offerwall/upwall/postback") return upwallPostback(request, env);
       if (url.pathname === "/api/offerme/postback") return offermePostback(request, env);
       if (url.pathname === "/api/offerme/launch") return offermeLaunch(request, env);
       if (url.pathname === "/postback/gaintwall") return gaintwallPostback(request, env);
@@ -880,6 +887,86 @@ async function offermeLaunch(request, env) {
   target.searchParams.set("identitySignature", signature);
   return json({ success: true, url: target.toString() }, 200, { "Cache-Control": "no-store, private" });
 }
+
+async function upwallPostback(request, env) {
+  if (!["GET", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
+  if (!env.DB || !env.UPWALL_POSTBACK_PASSWORD) return new Response("server configuration error", { status: 500 });
+  await ensureSchema(env);
+
+  const q = await readPostbackParams(request);
+  const userId = (q.get("userid") || "").trim();
+  const suppliedPassword = (q.get("password") || "").trim();
+  const rawReward = q.get("user_amount");
+  const tx = (q.get("transactionID") || q.get("transaction_id") || "").trim();
+  const offerId = (q.get("offer_id") || "").trim();
+  const offerName = (q.get("offer_name") || "Upwall offer").trim();
+  const payoutRaw = q.get("payout") || "0";
+  const payout = Number(payoutRaw);
+
+  if (!userId || !suppliedPassword || rawReward === null || !tx) {
+    return new Response("bad request", { status: 400 });
+  }
+  if (!constantTimeEqual(suppliedPassword, String(env.UPWALL_POSTBACK_PASSWORD))) {
+    return new Response("invalid password", { status: 403 });
+  }
+  if (!Number.isFinite(payout)) return new Response("invalid payout", { status: 400 });
+
+  const user = await dbUserByDatabaseId(env.DB, userId);
+  if (!user) return new Response("unknown user", { status: 404 });
+
+  const transactionId = "upwall:" + tx;
+  const now = Math.floor(Date.now() / 1000);
+
+  // Upwall documents negative payout values for reversed leads.
+  if (payout < 0) {
+    const original = await env.DB.prepare(
+      "SELECT user_id,amount,status FROM offerwall_conversions WHERE transaction_id=? LIMIT 1"
+    ).bind(transactionId).first();
+    if (!original || String(original.status).toLowerCase() === "reversed") {
+      return new Response("OK", { status: 200 });
+    }
+    const reversal = -Math.abs(Number(original.amount));
+    try {
+      await env.DB.batch([
+        env.DB.prepare("UPDATE offerwall_conversions SET status='reversed' WHERE transaction_id=?").bind(transactionId),
+        env.DB.prepare("UPDATE wallets SET balance=MAX(0,balance+?),updated_at=? WHERE user_id=?")
+          .bind(reversal, now, original.user_id),
+        env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
+          .bind(original.user_id, "upwall_offer_reversal", reversal, "Upwall offer reversal", now)
+      ]);
+    } catch (e) {
+      console.error("Upwall reversal error:", e);
+      return new Response("server error", { status: 500 });
+    }
+    return new Response("OK", { status: 200 });
+  }
+
+  const rewardNumber = Number(rawReward);
+  if (!Number.isFinite(rewardNumber) || rewardNumber <= 0) return new Response("invalid reward", { status: 400 });
+  const reward = Math.trunc(rewardNumber);
+  if (reward <= 0) return new Response("OK", { status: 200 });
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO offerwall_conversions
+        (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`)
+        .bind(transactionId, user.id, reward, "credited", offerId || null, offerName,
+          null, Math.max(0, payout), 0, now),
+      env.DB.prepare("UPDATE wallets SET balance=balance+?,lifetime_earned=lifetime_earned+?,updated_at=? WHERE user_id=?")
+        .bind(reward, reward, now, user.id),
+      env.DB.prepare("INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)")
+        .bind(user.id, "upwall_offer_reward", reward, "Upwall offer reward", now)
+    ]);
+  } catch (e) {
+    const message = String(e?.message || e).toLowerCase();
+    if (message.includes("unique") || message.includes("constraint")) return new Response("OK", { status: 200 });
+    console.error("Upwall credit error:", e);
+    return new Response("server error", { status: 500 });
+  }
+  return new Response("OK", { status: 200 });
+}
+
 
 async function offermePostback(request, env) {
   if (request.method !== "GET" && request.method !== "POST") return new Response("Method not allowed", { status: 405 });
@@ -2203,6 +2290,78 @@ async function boot(){
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 </script>
 </body></html>`;
+}
+
+function renderAdmin() {
+  return String.raw`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Cove Admin</title>
+<style>body{font-family:Arial;margin:0;background:#f4f6f9;color:#111827}.wrap{max-width:1100px;margin:auto;padding:20px}.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;overflow:auto;box-shadow:0 5px 18px rgba(0,0,0,.05)}.input,.btn{padding:12px;border-radius:10px;border:1px solid #ddd}.btn{background:#111827;color:#fff;border:0;font-weight:700}.danger{background:#b91c1c}table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}</style></head><body><div class="wrap"><div id="app"><div class="card"><h2>Coin Cove Admin</h2><p>Admin login</p><input id="adminUser" class="input" placeholder="Admin Username" autocomplete="username"><input id="adminPass" class="input" type="password" placeholder="Admin Password" autocomplete="current-password"><button class="btn" style="margin-top:10px" onclick="doLogin()">Login</button><p class="small" style="margin-top:10px">Build 2026-09-24-auth-fix-v5</p></div></div></div>
+<script>
+const storage={
+ get(k){try{return window.localStorage.getItem(k)||''}catch(e){console.warn('Storage read failed:',e);return ''}},
+ set(k,v){try{window.localStorage.setItem(k,v)}catch(e){console.warn('Storage write failed:',e)}},
+ remove(k){try{window.localStorage.removeItem(k)}catch(e){console.warn('Storage remove failed:',e)}}
+};
+let token=storage.get('cc_admin_token');
+const esc=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
+async function api(p,o={}){
+ const headers=Object.assign({'Content-Type':'application/json'},o.headers||{},token?{'Authorization':'Bearer '+token}:{});
+ const controller=new AbortController();
+ const timeout=setTimeout(()=>controller.abort(),15000);
+ try{
+   const r=await fetch(p,Object.assign({},o,{headers,signal:controller.signal}));
+   let d;try{d=await r.json()}catch{d={success:false,message:'Server response was invalid.'}}
+   if(!r.ok&&!d.message)d.message='Request failed ('+r.status+').';
+   return d;
+ }catch(e){
+   return {success:false,code:e?.name==='AbortError'?'TIMEOUT':'NETWORK_ERROR',message:e?.name==='AbortError'?'The server took too long to respond.':'Unable to connect to the server.'};
+ }finally{clearTimeout(timeout)}
+}
+async function boot(){
+ try{
+   const m=await api('/api/admin/me');
+   if(!m.success){login();return}
+   dash();
+ }catch(e){
+   document.getElementById('app').innerHTML='<div class="card"><h2>Unable to load Admin</h2><p>'+esc(e?.message||'Unexpected error.')+'</p><button class="btn" onclick="location.reload()">Retry</button></div>';
+ }
+}
+function login(){document.getElementById('app').innerHTML='<div class="card"><h2>Coin Cove Admin</h2><input id="adminUser" class="input" placeholder="Admin Username" autocomplete="username"><input id="adminPass" class="input" type="password" placeholder="Admin Password" autocomplete="current-password"><button class="btn" style="margin-top:10px" onclick="doLogin()">Login</button></div>'}
+async function doLogin(){const username=document.getElementById('adminUser')?.value.trim()||'';const password=document.getElementById('adminPass')?.value||'';if(!username||!password){alert('Enter admin username and password.');return}const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username,password})});if(!d.success)return alert(d.message||'Admin login failed.');token=d.token;storage.set('cc_admin_token',token);dash()}
+async function dash(){const [us,ws]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals')]);if(!us.success||!ws.success){document.getElementById('app').innerHTML='<div class="card"><h2>Admin data could not be loaded</h2><p>'+esc(us.message||ws.message||'Please try again.')+'</p><button class="btn" onclick="dash()">Retry</button><button class="btn secondary" style="margin-top:8px" onclick="logout()">Back to login</button></div>';return}document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Telegram Bot</h3><p>Connect the bot webhook so /start opens Coin Cove in Telegram.</p><button class="btn" onclick="setupTelegram()">Connect Telegram Bot</button><span id="tgSetupStatus" class="small" style="margin-left:8px"></span></div><div class="card"><h3>Users</h3><table><tr><th>ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(Number(x.usd_cents||0)/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\'approve\')">Approve</button> <button class="btn danger" onclick="act('+x.id+',\'reject\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}
+async function setupTelegram(){const el=document.getElementById('tgSetupStatus');if(el)el.textContent='Connecting...';const d=await api('/api/admin/telegram/setup',{method:'POST'});if(el)el.textContent=d.success?'Connected':'Failed';alert(d.message||d.description||(d.success?'Telegram webhook connected.':'Telegram setup failed.'));}
+async function act(id,a){const d=await api('/api/admin/withdrawal',{method:'POST',body:JSON.stringify({id,action:a})});alert(d.message||'Done');dash()}
+async function logout(){await api('/api/admin/logout',{method:'POST'});storage.remove('cc_admin_token');token='';login()}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
+</script></body></html>`;
+}
+
+function renderLegalPage(kind) {
+  const privacy = kind === "privacy";
+  const title = privacy ? "Privacy Policy" : "Terms of Service";
+  const body = privacy ? `
+    <p>This Privacy Policy explains how Coin Cove ("Coin Cove", "we", "us") handles information when you use our website or Telegram Mini App. Use Coin Cove only if you agree with this policy.</p>
+    <h2>Information we may process</h2><ul>
+      <li><b>Account details:</b> email address for website accounts, and Telegram account identifiers and profile details made available to the Mini App.</li>
+      <li><b>Account activity:</b> Coin balances, rewards, offer completion records, referral activity, transaction history, and withdrawal requests.</li>
+      <li><b>Withdrawal details:</b> the payment method and destination you submit when requesting a withdrawal.</li>
+      <li><b>Technical and security data:</b> information included in requests or provider callbacks that is needed to operate the service, prevent abuse, and troubleshoot errors.</li></ul>
+    <h2>How we use information</h2><p>We use this information to create and secure accounts, display balances, record rewards and reversals, process withdrawal requests, provide support, detect fraud or duplicate activity, and operate and improve Coin Cove.</p>
+    <h2>Offerwalls and advertising partners</h2><p>When you open an offerwall or interact with an advertisement, the relevant third-party provider may receive identifiers and activity data needed to attribute offers, measure events, apply its own rules, and validate rewards. Those providers process data under their own privacy policies. Coin Cove cannot control the independent practices of third-party services.</p>
+    <h2>Sharing and disclosure</h2><p>We may share the minimum information needed with offerwall, advertising, hosting, database, and payment-related service providers to operate Coin Cove; and when reasonably necessary to protect users, investigate abuse, enforce our terms, or comply with applicable law. We do not intend to sell personal information.</p>
+    <h2>Storage and security</h2><p>Account and transaction records may be stored in our service database. On website login, a session token may be stored in your browser's local storage so you can remain signed in. We use reasonable measures intended to protect information, but no internet service or storage system can be guaranteed completely secure.</p>
+    <h2>Retention and your choices</h2><p>We retain information for as long as reasonably needed to operate accounts, maintain transaction records, resolve disputes, prevent fraud, and meet legal or provider requirements. You can stop using Coin Cove at any time. To ask about access, correction, or deletion, contact Coin Cove through its official support channel; some records may need to be retained for legitimate operational or legal reasons.</p>
+    <h2>Children and changes</h2><p>Coin Cove is not intended for people who are not legally permitted to use the service or the relevant third-party offers. We may update this policy when the service or applicable requirements change. The latest version will be published on this page.</p>
+  ` : `
+    <p>These Terms of Service govern your use of Coin Cove (the website and Telegram Mini App). By accessing or using Coin Cove, you agree to these terms. If you do not agree, do not use the service.</p>
+    <h2>Using Coin Cove</h2><p>You must provide accurate information, protect your login credentials, and use Coin Cove lawfully. You are responsible for activity performed through your account. Do not impersonate others, exploit bugs, interfere with the service, or use bots, fake accounts, misleading information, or other fraudulent methods to obtain rewards.</p>
+    <h2>Offers and rewards</h2><p>Coins are in-platform reward units, not a bank deposit, investment, or guaranteed cash value. Offer availability, eligibility, completion rules, and approval are controlled in part by third-party offerwall and advertising providers. A displayed offer or pending action does not guarantee a reward. Rewards may be delayed, rejected, corrected, or reversed if a provider reports an invalid, duplicate, cancelled, or chargeback event.</p>
+    <h2>Withdrawals</h2><p>Withdrawal requests are subject to the minimums, methods, limits, review process, and availability displayed in Coin Cove at the time of the request. You must provide a correct destination and use a payment method you are authorized to use. Submitting a request does not guarantee approval or a specific processing time. We may pause or reject requests where required information is missing or suspicious activity is detected.</p>
+    <h2>Third-party services</h2><p>Coin Cove may link to or display third-party offerwalls, advertisements, and services. Those services may have separate terms and privacy policies. We are not responsible for third-party content, availability, offer decisions, or their independent services.</p>
+    <h2>Suspension and changes</h2><p>We may investigate suspicious activity, withhold disputed rewards, limit features, or suspend accounts where we reasonably believe these terms have been violated or where needed to protect Coin Cove and its users. We may change or discontinue features and update these terms. Continued use after an update means you accept the updated terms.</p>
+    <h2>Availability and liability</h2><p>Coin Cove is provided on an "as available" basis. We do not guarantee uninterrupted access, continuous offer availability, or that every provider callback will be immediate. To the extent permitted by applicable law, Coin Cove is not liable for indirect losses arising from third-party services, provider decisions, outages, or unauthorized activity outside our reasonable control.</p>
+    <h2>Contact</h2><p>For questions about these terms, contact Coin Cove through its official support channel.</p>
+  `;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0f172a"><title>${title} — Coin Cove</title><style>:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f7ff;background:#070b18;--line:rgba(155,180,255,.14)}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 10% 0%,rgba(62,93,214,.24),transparent 35%),radial-gradient(ellipse at 100% 25%,rgba(30,204,188,.12),transparent 30%),linear-gradient(160deg,#080d1d,#0a1022 52%,#070b17);color:#f4f7ff}.legal-page{max-width:820px;margin:0 auto;padding:24px 16px 48px}.legal-card{background:linear-gradient(145deg,rgba(19,29,53,.97),rgba(12,19,37,.98));border:1px solid var(--line);border-radius:24px;padding:clamp(20px,4vw,34px);box-shadow:0 18px 45px rgba(0,0,0,.22)}a{color:#7df2dc;text-decoration:none;font-weight:800}.brand{font-weight:950;font-size:21px}.legal-page h1{font-size:clamp(28px,6vw,38px);margin:14px 0 6px;letter-spacing:-1px}.legal-page h2{font-size:18px;margin:25px 0 8px}.legal-page p,.legal-page li{color:#c0cbe2;line-height:1.75;font-size:14px}.legal-date{color:#8e9bb8;font-size:12px}.legal-page ul{padding-left:22px}.links{display:flex;gap:16px;flex-wrap:wrap;margin-top:26px;padding-top:18px;border-top:1px solid var(--line)}</style></head><body><main class="legal-page"><a class="legal-back" href="/">← Back to Coin Cove</a><section class="legal-card"><div class="brand">🌊 Coin Cove</div><h1>${title}</h1><div class="legal-date">Last updated: October 12, 2026</div>${body}<div class="links"><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a><a href="/">Coin Cove Home</a></div></section></main></body></html>`;
 }
 
 function renderAdmin() {
