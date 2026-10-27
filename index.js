@@ -2043,6 +2043,31 @@ button,input,select{font:inherit}button{cursor:pointer;transition:transform .18s
 @media(min-width:600px){.wrap{padding-top:32px}.wrap>.card:nth-of-type(2){padding:32px}.actions{gap:14px}.navin{padding:12px 18px}}
 @media(max-width:430px){.offer-grid{gap:10px}.offer-grid .offer{min-height:158px;padding:14px;border-radius:19px}.offer-grid .offer strong{font-size:16px;margin:10px 0 7px}.offer-grid .offer .small{font-size:11px}.wrap{padding:15px 12px calc(105px + env(safe-area-inset-bottom))}.top{margin-bottom:18px}.brand,.top .brand{font-size:21px}.card{padding:18px;border-radius:23px;margin-bottom:13px}.wrap>.card:nth-of-type(2){padding:21px;min-height:250px}.balance{font-size:39px;letter-spacing:-1.8px}.stat{padding:13px;border-radius:16px}.stat b{font-size:20px}.title{font-size:18px;margin-bottom:15px}.btn{padding:15px 13px;font-size:14px}.navin{gap:4px;padding:8px 8px 7px}.nav button{font-size:11px;border-radius:14px}.offer{padding:16px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+
+/* Coin Cove visual refresh: emerald neon theme inspired by the supplied references. */
+:root{--bg:#050a0b;--panel:#0e1518;--panel2:#121d20;--line:rgba(87,255,180,.14);--muted:#95a7ad;--cyan:#00e887;--blue:#13c985;--violet:#b47cff;--gold:#ffbd59}
+body{background:radial-gradient(ellipse at 50% 0%,rgba(0,232,135,.12),transparent 38%),radial-gradient(ellipse at 0% 45%,rgba(0,160,100,.10),transparent 34%),linear-gradient(160deg,#05090c 0%,#071311 52%,#05090b 100%)}
+body:before{opacity:.09;background-image:radial-gradient(#5bffc0 .55px,transparent .55px)}
+.card{background:linear-gradient(145deg,rgba(17,25,28,.97),rgba(10,17,19,.98));border-color:rgba(114,255,190,.12);box-shadow:0 16px 38px rgba(0,0,0,.24),inset 0 1px 0 rgba(255,255,255,.025)}
+.wrap>.card:nth-of-type(2){background:radial-gradient(ellipse at 100% 0%,rgba(0,232,135,.17),transparent 42%),radial-gradient(ellipse at 0% 100%,rgba(0,135,85,.15),transparent 48%),linear-gradient(135deg,#0b2119 0%,#0c1917 58%,#101a18 100%);border-color:rgba(0,232,135,.22)}
+.balance{background:linear-gradient(100deg,#fff 15%,#baffd9 72%,#68f7b4);-webkit-background-clip:text;background-clip:text}
+.btn{background:linear-gradient(110deg,#00e887,#12c987 58%,#6af0ae);color:#042117;box-shadow:0 8px 24px rgba(0,232,135,.15),inset 0 1px 0 rgba(255,255,255,.24)}
+.btn.secondary{background:linear-gradient(135deg,#182522,#121c1a);color:#e9fff4;border-color:rgba(100,255,177,.15)}
+.btn.good{background:linear-gradient(110deg,#00e887,#7ce9a7);color:#052519}
+.input,.select{background:#080f10;border-color:rgba(112,255,180,.17)}
+.input:focus,.select:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(0,232,135,.11)}
+.offer{background:linear-gradient(135deg,rgba(20,35,29,.96),rgba(11,20,17,.98));border-color:rgba(115,255,183,.13)}
+.offer-grid .offer{background:radial-gradient(circle at 100% 0%,rgba(0,232,135,.13),transparent 48%),linear-gradient(145deg,rgba(17,34,27,.98),rgba(9,18,15,.99));border-color:rgba(115,255,183,.13)}
+.offer:hover,.offer-grid .offer:hover{border-color:rgba(0,232,135,.48)}
+.nav{background:rgba(5,10,11,.94);border-top-color:rgba(100,255,177,.15)}
+.navin{grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;padding:8px 10px 7px}
+.nav button{color:#84969a;font-size:11px;padding:8px 2px}
+.nav button.active{color:#00e887;background:rgba(0,232,135,.08);border-color:rgba(0,232,135,.13)}
+.nav button.quick-action{justify-self:center;align-self:center;width:56px;height:56px;border-radius:50%;padding:0;border:3px solid #03160d;background:linear-gradient(145deg,#00f28b,#00bd70);color:#03160d;font-size:24px;line-height:1;box-shadow:0 0 0 2px rgba(0,232,135,.22),0 0 24px rgba(0,232,135,.32)}
+.notice{background:rgba(0,232,135,.055);border-color:rgba(0,232,135,.14);color:#b9d8c9}
+.legal-footer{position:relative!important;bottom:auto!important;z-index:2!important;background:rgba(5,10,11,.96)!important;border-color:rgba(100,255,177,.12)!important;margin:0!important}
+.legal-footer a{color:#00e887!important}
+@media(max-width:430px){.navin{grid-template-columns:repeat(5,minmax(0,1fr));gap:3px;padding:7px 6px}.nav button.quick-action{width:52px;height:52px;font-size:22px}.nav button{font-size:10px}}
 </style>
 </head>
 <body>
@@ -2101,10 +2126,11 @@ function render(){
     (page==='home'?homePage(balance):page==='offers'?offersPage():page==='withdraw'?withdrawPage(balance):accountPage())+
   '</div>'+
   '<div class="nav"><div class="navin">'+
-    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">🏠<br>Home</button>'+
-    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">🎁<br>Offers</button>'+
-    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">💸<br>Withdraw</button>'+
-    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">👤<br>Account</button>'+
+    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">⌂<br>Home</button>'+
+    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">▱<br>Earn</button>'+
+    '<button class="quick-action" aria-label="Open Tapjoy offerwall" onclick="showTapjoy()">ϟ</button>'+
+    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">▣<br>Wallet</button>'+
+    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">☰<br>Menu</button>'+
   '</div></div>';
 }
 function homePage(balance){
