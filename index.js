@@ -1,5 +1,5 @@
 const APP_NAME = "Coin Cove";
-const BUILD_VERSION = "2026-09-26-offerwalls-v9-adswed";
+const BUILD_VERSION = "2026-10-31-ogads-v1";
 const TAPJOY_SDK_KEY = "277Mt0yeQyuT_sZLoCUE_gEC0KXJGsauFETqGFqtLDz4ZQ0B_sGMBmpWRx1y";
 const TAPJOY_PLACEMENT = "coincover";
 const POINTS_NAME = "Coins";
@@ -47,6 +47,7 @@ export default {
           database: !!env.DB,
           botConfigured: !!env.BOT_TOKEN,
           offerwallConfigured: !!env.OFFERWALL_SECRET,
+          ogadsConfigured: !!env.OGADS_API_KEY && !!env.OGADS_POSTBACK_SECRET,
           tapjoyConfigured: !!env.TAPJOY_VC_SECRET,
           telegramWebhookConfigured: true,
           time: Date.now()
@@ -57,6 +58,8 @@ export default {
       if (url.pathname === "/api/referral") return apiReferral(request, env);
       if (url.pathname === "/api/reward-ad") return rewardAd(request, env);
 
+      if (url.pathname === "/api/offerwall/ogads/offers") return ogadsOffers(request, env);
+      if (url.pathname === "/api/offerwall/ogads/postback") return ogadsPostback(request, env);
       if (url.pathname === "/api/offerwall/postback") return offerwallPostback(request, env);
       if (url.pathname === "/api/offerwall/cpidroid/postback") return cpidroidPostback(request, env);
       if (url.pathname === "/api/offerwall/notik/postback") return notikPostback(request, env);
@@ -406,6 +409,120 @@ async function adswedPostback(request, env) {
   return new Response("OK", { status: 200 });
 }
 
+async function ogadsOffers(request, env) {
+  if (request.method !== "GET") return json({ success: false, message: "Method not allowed." }, 405);
+  if (!env.DB) return json({ success: false, message: "Database is unavailable." }, 500);
+  const identity = await resolveUserAuth(request, env);
+  if (!identity) return json({ success: false, message: "Please sign in again." }, 401);
+  const apiKey = String(env.OGADS_API_KEY || "").trim();
+  if (!apiKey) return json({ success: false, message: "OGAds is not configured yet." }, 503);
+
+  const incoming = new URL(request.url);
+  const headers = request.headers;
+  const ip = String(headers.get("CF-Connecting-IP") || "").trim();
+  const userAgent = String(headers.get("User-Agent") || "").trim();
+  if (!ip || !userAgent) return json({ success: false, message: "Unable to determine device information." }, 400);
+
+  const apiUrl = new URL("https://trkoffer.net/api/v2");
+  apiUrl.searchParams.set("ip", ip);
+  apiUrl.searchParams.set("user_agent", userAgent);
+  apiUrl.searchParams.set("lang", String(headers.get("Accept-Language") || "en").split(",")[0].split("-")[0].slice(0, 12));
+  apiUrl.searchParams.set("site", incoming.origin);
+  // OGAds documents aff_sub4 as a supported Sub-ID. Keep the Coin Cove database ID here.
+  apiUrl.searchParams.set("aff_sub4", String(identity.userId));
+
+  try {
+    const response = await fetch(apiUrl.toString(), {
+      method: "GET",
+      headers: { "Authorization": "Bearer " + apiKey, "Accept": "application/json" },
+      signal: AbortSignal.timeout(15000)
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || !payload || payload.success !== true || !Array.isArray(payload.offers)) {
+      console.error("OGAds API returned an unsuccessful response:", response.status, payload?.error || "invalid response");
+      return json({ success: false, message: "OGAds could not load offers right now." }, 502);
+    }
+    const offers = payload.offers.map((offer) => {
+      let link = "";
+      try {
+        const parsed = new URL(String(offer.link || ""));
+        if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+          parsed.searchParams.set("aff_sub4", String(identity.userId));
+          link = parsed.toString();
+        }
+      } catch {}
+      let picture = "";
+      try {
+        const parsed = new URL(String(offer.picture || ""));
+        if (parsed.protocol === "https:") picture = parsed.toString();
+      } catch {}
+      const payout = Number(offer.payout);
+      return {
+        offerid: String(offer.offerid ?? ""),
+        name: String(offer.name_short || offer.name || "Offer").slice(0, 180),
+        description: String(offer.adcopy || offer.description || "Complete the offer requirements.").replace(/<[^>]*>/g, " ").slice(0, 500),
+        picture,
+        payout: Number.isFinite(payout) && payout >= 0 ? payout : 0,
+        country: String(offer.country || "Available countries").slice(0, 80),
+        device: String(offer.device || "All devices").slice(0, 80),
+        link
+      };
+    }).filter(o => o.offerid && o.link);
+    return json({ success: true, offers, count: offers.length });
+  } catch (e) {
+    console.error("OGAds offer fetch failed:", e);
+    return json({ success: false, message: "Unable to connect to OGAds. Please try again." }, 502);
+  }
+}
+
+async function ogadsPostback(request, env) {
+  if (!["GET", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
+  if (!env.DB) return new Response("server configuration error", { status: 500 });
+  const secret = String(env.OGADS_POSTBACK_SECRET || "").trim();
+  if (!secret) return new Response("postback secret is not configured", { status: 503 });
+  const q = await readPostbackParams(request);
+  const supplied = String(q.get("key") || "").trim();
+  if (!supplied || !constantTimeEqual(supplied, secret)) return new Response("invalid secret", { status: 403 });
+
+  const userId = String(q.get("user_id") || q.get("aff_sub4") || "").trim();
+  const offerId = String(q.get("offer_id") || "").trim();
+  const offerName = String(q.get("offer_name") || "OGAds offer").trim().slice(0, 180);
+  const payoutUsd = Number(q.get("payout"));
+  const ran = String(q.get("ran") || q.get("transaction_id") || "").trim();
+  const dateTime = String(q.get("datetime") || q.get("session_timestamp") || q.get("date") || "").trim();
+  if (!userId || !offerId || !Number.isFinite(payoutUsd) || payoutUsd <= 0 || !ran) {
+    return new Response("missing or invalid required parameters", { status: 400 });
+  }
+  const user = await dbUserByDatabaseId(env.DB, userId);
+  if (!user) return new Response("unknown user", { status: 404 });
+
+  // User share: 50% of the advertiser payout. Coin Cove uses 2,000 Coins per $1.
+  const coins = Math.round(payoutUsd * 0.5 * COINS_PER_USD);
+  if (coins <= 0) return new Response("payout is below the minimum credit", { status: 200 });
+  const uniqueSource = [ran, offerId, user.id, dateTime, String(q.get("session_ip") || "")].join("|");
+  const transactionId = "ogads:" + await sha256Hex(uniqueSource);
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    await ensureSchema(env);
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO offerwall_conversions
+        (transaction_id,user_id,amount,status,offer_id,offer_name,goal_id,payout_usd,test,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`)
+        .bind(transactionId, user.id, coins, "credited", offerId, offerName, null, payoutUsd, 0, now),
+      env.DB.prepare(`UPDATE wallets SET balance=balance+?, lifetime_earned=lifetime_earned+?, updated_at=? WHERE user_id=?`)
+        .bind(coins, coins, now, user.id),
+      env.DB.prepare(`INSERT INTO transactions(user_id,type,amount,description,created_at) VALUES(?,?,?,?,?)`)
+        .bind(user.id, "ogads_offer_reward", coins, "OGAds: " + offerName, now)
+    ]);
+  } catch (e) {
+    const message = String(e?.message || e).toLowerCase();
+    if (message.includes("unique") || message.includes("constraint")) return new Response("ok", { status: 200 });
+    console.error("OGAds credit error:", e);
+    return new Response("server error", { status: 500 });
+  }
+  return new Response("ok", { status: 200 });
+}
+
 async function processProviderPostback(request, env, provider, config) {
   if (!env.DB) return new Response("server configuration error", { status: 500 });
   await ensureSchema(env);
@@ -592,9 +709,25 @@ async function dbUserByDatabaseId(db, id) {
   return db.prepare("SELECT * FROM users WHERE id=? LIMIT 1").bind(numericId).first();
 }
 
+function generatePublicUserId() {
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  const token = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+  return "CC-" + token;
+}
+
+async function generateUniquePublicUserId(db) {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const candidate = generatePublicUserId();
+    const exists = await db.prepare("SELECT id FROM users WHERE public_id=? LIMIT 1").bind(candidate).first();
+    if (!exists) return candidate;
+  }
+  throw new Error("Unable to generate a unique public user ID.");
+}
+
 async function initSchema(db) {
   const stmts = [
-    `CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id TEXT UNIQUE, username TEXT, first_name TEXT, last_name TEXT, referral_code TEXT UNIQUE, referred_by TEXT, email TEXT UNIQUE, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT UNIQUE, telegram_id TEXT UNIQUE, username TEXT, first_name TEXT, last_name TEXT, referral_code TEXT UNIQUE, referred_by TEXT, email TEXT UNIQUE, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS wallets (user_id INTEGER PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 0, lifetime_earned INTEGER NOT NULL DEFAULT 0, lifetime_withdrawn INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS referrals (id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER NOT NULL, referred_user_id INTEGER NOT NULL UNIQUE, reward INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, type TEXT NOT NULL, amount INTEGER NOT NULL, description TEXT, created_at INTEGER NOT NULL)`,
@@ -629,6 +762,13 @@ async function initSchema(db) {
     if (!m.includes("duplicate column") && !m.includes("already exists")) console.error("users.email migration:", e);
   }
 
+  await ensureColumns(db, "users", { public_id: "TEXT" });
+  try {
+    await db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_public_id ON users(public_id)").run();
+  } catch (e) {
+    console.error("users.public_id index migration:", e);
+  }
+
   await ensureColumns(db, "withdrawals", {
     method: "TEXT",
     destination: "TEXT",
@@ -639,6 +779,13 @@ async function initSchema(db) {
     updated_at: "INTEGER",
     admin_note: "TEXT"
   });
+
+  // Assign a permanent public identifier to every existing account.
+  const missingPublicIds = await db.prepare("SELECT id FROM users WHERE public_id IS NULL OR public_id='' ORDER BY id ASC").all();
+  for (const row of (missingPublicIds.results || [])) {
+    const publicId = await generateUniquePublicUserId(db);
+    await db.prepare("UPDATE users SET public_id=? WHERE id=? AND (public_id IS NULL OR public_id='')").bind(publicId, row.id).run();
+  }
 }
 
 async function ensureColumns(db, table, definitions) {
@@ -694,10 +841,10 @@ async function getOrCreateTelegramUser(db, td) {
     }
 
     await db.prepare(`
-      INSERT INTO users(telegram_id,username,first_name,last_name,referral_code,referred_by,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?)
+      INSERT INTO users(public_id,telegram_id,username,first_name,last_name,referral_code,referred_by,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?)
     `).bind(
-      tid, u.username || null, u.first_name || "", u.last_name || null,
+      await generateUniquePublicUserId(db), tid, u.username || null, u.first_name || "", u.last_name || null,
       generateReferralCode(), referredBy, now, now
     ).run();
 
@@ -738,7 +885,7 @@ async function userPayload(db, userId, extra = {}) {
     FROM withdrawals WHERE user_id=? ORDER BY id DESC LIMIT 10
   `).bind(userId).all();
   const user = await db.prepare(`
-    SELECT id,telegram_id,username,first_name,last_name,referral_code,email
+    SELECT id,public_id,telegram_id,username,first_name,last_name,referral_code,email
     FROM users WHERE id=?
   `).bind(userId).first();
 
@@ -1399,9 +1546,9 @@ async function emailRegister(request, env) {
   try {
     if (!user) {
       await env.DB.prepare(`
-        INSERT INTO users(telegram_id,email,first_name,referral_code,created_at,updated_at)
-        VALUES(?,?,?,?,?,?)
-      `).bind(syntheticTelegramId, email, "", generateReferralCode(), now, now).run();
+        INSERT INTO users(public_id,telegram_id,email,first_name,referral_code,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?)
+      `).bind(await generateUniquePublicUserId(env.DB), syntheticTelegramId, email, "", generateReferralCode(), now, now).run();
       user = await env.DB.prepare("SELECT * FROM users WHERE email=? LIMIT 1").bind(email).first();
     }
     if (!user) throw new Error("Email account was not created.");
@@ -2043,31 +2190,6 @@ button,input,select{font:inherit}button{cursor:pointer;transition:transform .18s
 @media(min-width:600px){.wrap{padding-top:32px}.wrap>.card:nth-of-type(2){padding:32px}.actions{gap:14px}.navin{padding:12px 18px}}
 @media(max-width:430px){.offer-grid{gap:10px}.offer-grid .offer{min-height:158px;padding:14px;border-radius:19px}.offer-grid .offer strong{font-size:16px;margin:10px 0 7px}.offer-grid .offer .small{font-size:11px}.wrap{padding:15px 12px calc(105px + env(safe-area-inset-bottom))}.top{margin-bottom:18px}.brand,.top .brand{font-size:21px}.card{padding:18px;border-radius:23px;margin-bottom:13px}.wrap>.card:nth-of-type(2){padding:21px;min-height:250px}.balance{font-size:39px;letter-spacing:-1.8px}.stat{padding:13px;border-radius:16px}.stat b{font-size:20px}.title{font-size:18px;margin-bottom:15px}.btn{padding:15px 13px;font-size:14px}.navin{gap:4px;padding:8px 8px 7px}.nav button{font-size:11px;border-radius:14px}.offer{padding:16px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
-
-/* Coin Cove visual refresh: emerald neon theme inspired by the supplied references. */
-:root{--bg:#050a0b;--panel:#0e1518;--panel2:#121d20;--line:rgba(87,255,180,.14);--muted:#95a7ad;--cyan:#00e887;--blue:#13c985;--violet:#b47cff;--gold:#ffbd59}
-body{background:radial-gradient(ellipse at 50% 0%,rgba(0,232,135,.12),transparent 38%),radial-gradient(ellipse at 0% 45%,rgba(0,160,100,.10),transparent 34%),linear-gradient(160deg,#05090c 0%,#071311 52%,#05090b 100%)}
-body:before{opacity:.09;background-image:radial-gradient(#5bffc0 .55px,transparent .55px)}
-.card{background:linear-gradient(145deg,rgba(17,25,28,.97),rgba(10,17,19,.98));border-color:rgba(114,255,190,.12);box-shadow:0 16px 38px rgba(0,0,0,.24),inset 0 1px 0 rgba(255,255,255,.025)}
-.wrap>.card:nth-of-type(2){background:radial-gradient(ellipse at 100% 0%,rgba(0,232,135,.17),transparent 42%),radial-gradient(ellipse at 0% 100%,rgba(0,135,85,.15),transparent 48%),linear-gradient(135deg,#0b2119 0%,#0c1917 58%,#101a18 100%);border-color:rgba(0,232,135,.22)}
-.balance{background:linear-gradient(100deg,#fff 15%,#baffd9 72%,#68f7b4);-webkit-background-clip:text;background-clip:text}
-.btn{background:linear-gradient(110deg,#00e887,#12c987 58%,#6af0ae);color:#042117;box-shadow:0 8px 24px rgba(0,232,135,.15),inset 0 1px 0 rgba(255,255,255,.24)}
-.btn.secondary{background:linear-gradient(135deg,#182522,#121c1a);color:#e9fff4;border-color:rgba(100,255,177,.15)}
-.btn.good{background:linear-gradient(110deg,#00e887,#7ce9a7);color:#052519}
-.input,.select{background:#080f10;border-color:rgba(112,255,180,.17)}
-.input:focus,.select:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(0,232,135,.11)}
-.offer{background:linear-gradient(135deg,rgba(20,35,29,.96),rgba(11,20,17,.98));border-color:rgba(115,255,183,.13)}
-.offer-grid .offer{background:radial-gradient(circle at 100% 0%,rgba(0,232,135,.13),transparent 48%),linear-gradient(145deg,rgba(17,34,27,.98),rgba(9,18,15,.99));border-color:rgba(115,255,183,.13)}
-.offer:hover,.offer-grid .offer:hover{border-color:rgba(0,232,135,.48)}
-.nav{background:rgba(5,10,11,.94);border-top-color:rgba(100,255,177,.15)}
-.navin{grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;padding:8px 10px 7px}
-.nav button{color:#84969a;font-size:11px;padding:8px 2px}
-.nav button.active{color:#00e887;background:rgba(0,232,135,.08);border-color:rgba(0,232,135,.13)}
-.nav button.quick-action{justify-self:center;align-self:center;width:56px;height:56px;border-radius:50%;padding:0;border:3px solid #03160d;background:linear-gradient(145deg,#00f28b,#00bd70);color:#03160d;font-size:24px;line-height:1;box-shadow:0 0 0 2px rgba(0,232,135,.22),0 0 24px rgba(0,232,135,.32)}
-.notice{background:rgba(0,232,135,.055);border-color:rgba(0,232,135,.14);color:#b9d8c9}
-.legal-footer{position:relative!important;bottom:auto!important;z-index:2!important;background:rgba(5,10,11,.96)!important;border-color:rgba(100,255,177,.12)!important;margin:0!important}
-.legal-footer a{color:#00e887!important}
-@media(max-width:430px){.navin{grid-template-columns:repeat(5,minmax(0,1fr));gap:3px;padding:7px 6px}.nav button.quick-action{width:52px;height:52px;font-size:22px}.nav button{font-size:10px}}
 </style>
 </head>
 <body>
@@ -2126,11 +2248,10 @@ function render(){
     (page==='home'?homePage(balance):page==='offers'?offersPage():page==='withdraw'?withdrawPage(balance):accountPage())+
   '</div>'+
   '<div class="nav"><div class="navin">'+
-    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">⌂<br>Home</button>'+
-    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">▱<br>Earn</button>'+
-    '<button class="quick-action" aria-label="Open Tapjoy offerwall" onclick="showTapjoy()">ϟ</button>'+
-    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">▣<br>Wallet</button>'+
-    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">☰<br>Menu</button>'+
+    '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">🏠<br>Home</button>'+
+    '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">🎁<br>Offers</button>'+
+    '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">💸<br>Withdraw</button>'+
+    '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">👤<br>Account</button>'+
   '</div></div>';
 }
 function homePage(balance){
@@ -2153,6 +2274,7 @@ function offersPage(){
  return '<div class="card"><h2>Offerwalls</h2><div class="notice">Complete eligible offers. Rewards are credited by each provider after its server callback is received.</div></div>'+
  '<div class="card"><div class="offer-grid">'+
  '<button class="offer" onclick="showTapjoy()"><strong>⚡ Tapjoy</strong><span class="small">Open Tapjoy Web Offerwall</span></button>'+
+ '<button class="offer" onclick="loadOgadsOffers()"><strong>🟣 OGAds</strong><span class="small">Browse personalized offers and earn 50% of the payout</span></button>'+
  '<button class="offer" onclick="openProvider(\'cpidroid\')"><strong>🎯 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'notik\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'admantum\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
@@ -2161,7 +2283,26 @@ function offersPage(){
  '<button class="offer" onclick="openProvider(\'offerme\')"><strong>🪙 Offerwall.me</strong><span class="small">Open provider wall</span></button>'+
 '<button class="offer" onclick="openProvider(\'gaintwall\')"><strong>🌟 Gaintwall</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'bitlabs\')"><strong>🧪 BitLabs</strong><span class="small">Offers, Games & Surveys</span></button>'+
- '</div></div>';
+ '</div></div>'+
+ '<div class="card" id="ogads-results-card"><div class="close-row"><h2>OGAds Offers</h2><button class="close" onclick="loadOgadsOffers()">↻ Refresh</button></div><div class="small" id="ogads-status">Tap the OGAds card above to load offers matched to your device and location.</div><div class="offer-grid" id="ogads-offers-grid"></div></div>';
+}
+async function loadOgadsOffers(){
+ const status=document.getElementById('ogads-status'),grid=document.getElementById('ogads-offers-grid');
+ if(!status||!grid)return; status.textContent='Loading offers for your device…';grid.innerHTML='';
+ const data=await api('/api/offerwall/ogads/offers');
+ if(!data.success){status.textContent=data.message||'Unable to load OGAds offers.';return}
+ if(!data.offers?.length){status.textContent='No eligible OGAds offers are available for your device or country right now.';return}
+ status.textContent=data.offers.length+' offers available. Complete each offer exactly as described.';
+ data.offers.forEach(o=>{
+  const card=document.createElement('div');card.className='offer';card.style.cssText='min-height:210px;aspect-ratio:auto;display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:13px;';
+  if(o.picture){const img=document.createElement('img');img.src=o.picture;img.alt='';img.loading='lazy';img.referrerPolicy='no-referrer';img.style.cssText='width:100%;height:105px;object-fit:cover;border-radius:13px;background:#0a1224;';card.appendChild(img)}
+  const title=document.createElement('strong');title.textContent=o.name;card.appendChild(title);
+  const payout=document.createElement('div');payout.style.cssText='color:#65f0d2;font-weight:900;font-size:17px';payout.textContent='$'+Number(o.payout||0).toFixed(2)+' payout';card.appendChild(payout);
+  const reward=document.createElement('div');reward.className='small';reward.textContent='Your reward: '+Math.round(Number(o.payout||0)*1000).toLocaleString()+' Coins';card.appendChild(reward);
+  const details=document.createElement('div');details.className='small';details.textContent=(o.country||'')+' · '+(o.device||'');card.appendChild(details);
+  const desc=document.createElement('div');desc.className='small';desc.textContent=o.description||'';card.appendChild(desc);
+  const go=document.createElement('button');go.className='btn';go.textContent='Start offer';go.onclick=()=>{const w=window.open(o.link,'_blank','noopener,noreferrer');if(!w)alert('Please allow pop-ups to open this offer.')};card.appendChild(go);grid.appendChild(card);
+ });
 }
 function openOffers(){page='offers';render()}
 async function openProvider(name){
@@ -2226,7 +2367,7 @@ function withdrawalsHtml(){
  return ws.map(x=>'<div class="row" style="padding:9px 0;border-bottom:1px solid #1e293b"><div><b>'+Number(x.coins).toLocaleString()+' Coins</b><div class="small">'+esc(x.method)+' · '+new Date(Number(x.created_at)*1000).toLocaleString()+'</div></div><strong>'+esc(x.status)+'</strong></div>').join('');
 }
 function accountPage(){
- return '<div class="card"><h2>Account</h2><div class="notice"><b>ID:</b> '+esc(state.user?.id)+'<br><b>Email:</b> '+esc(state.user?.email||'Telegram account')+'</div></div>'+
+ return '<div class="card"><h2>Account</h2><div class="notice"><b>User ID:</b> '+esc(state.user?.public_id||'—')+'<br><b>Email:</b> '+esc(state.user?.email||'Telegram account')+'</div></div>'+
  '<div class="card"><div class="title">Referral</div><div class="small">Your referral code: '+esc(state.user?.referral_code||'')+'</div><button class="btn secondary" style="margin-top:10px" onclick="loadReferral()">Get referral link</button></div>';
 }
 async function loadReferral(){
