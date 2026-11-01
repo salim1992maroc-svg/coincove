@@ -2461,6 +2461,18 @@ function showTapjoy(){
 }
 function closeWall(){document.getElementById('wall')?.remove()}
 function nav(p){page=p;render()}
+async function applyProviderVisibility(){
+  try{
+    const d=await api('/api/providers/visible');
+    if(!d?.success||!d.providers)return;
+    document.querySelectorAll('[data-provider]').forEach(el=>{
+      const key=el.getAttribute('data-provider');
+      if(Object.prototype.hasOwnProperty.call(d.providers,key)){
+        el.classList.toggle('hidden',d.providers[key]===false);
+      }
+    });
+  }catch(e){console.warn('Provider visibility could not be loaded:',e)}
+}
 function money(){return (Number(state?.wallet?.balance||0)/${COINS_PER_USD}).toFixed(2)}
 function render(){
   if(!state){loginScreen();return}
@@ -2499,16 +2511,16 @@ function offersPage(){
  '<div class="card"><div class="offer-grid">'+
  '<button class="offer" onclick="showTapjoy()" data-provider="tapjoy"><strong>⚡ Tapjoy</strong><span class="small">Open Tapjoy Web Offerwall</span></button>'+
  '<button class="offer" onclick="loadOgadsOffers()" data-provider="ogads"><strong>🟣 OGAds</strong><span class="small">Browse personalized offers and earn 50% of the payout</span></button>'+
- '<button class="offer" onclick="openProvider(\'cpidroid\')"><strong>🎯 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'notik\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'admantum\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'offerwallgg\')"><strong>💎 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'adswed\')"><strong>🟢 AdswedMedia</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'offerme\')"><strong>🪙 Offerwall.me</strong><span class="small">Open provider wall</span></button>'+
-'<button class="offer" onclick="openProvider(\'gaintwall\')"><strong>🌟 Gaintwall</strong><span class="small">Open provider wall</span></button>'+
- '<button class="offer" onclick="openProvider(\'bitlabs\')"><strong>🧪 BitLabs</strong><span class="small">Offers, Games & Surveys</span></button>'+
+ '<button class="offer" data-provider="cpidroid" onclick="openProvider(\'cpidroid\')"><strong>🎯 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" data-provider="notik" onclick="openProvider(\'notik\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" data-provider="admantum" onclick="openProvider(\'admantum\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" data-provider="offerwallgg" onclick="openProvider(\'offerwallgg\')"><strong>💎 Offerwall.GG</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" data-provider="adswed" onclick="openProvider(\'adswed\')"><strong>🟢 AdswedMedia</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" data-provider="offerme" onclick="openProvider(\'offerme\')"><strong>🪙 Offerwall.me</strong><span class="small">Open provider wall</span></button>'+
+'<button class="offer" data-provider="gaintwall" onclick="openProvider(\'gaintwall\')"><strong>🌟 Gaintwall</strong><span class="small">Open provider wall</span></button>'+
+ '<button class="offer" data-provider="bitlabs" onclick="openProvider(\'bitlabs\')"><strong>🧪 BitLabs</strong><span class="small">Offers, Games & Surveys</span></button>'+
  '</div></div>'+
- '<div class="card" id="ogads-results-card"><div class="close-row"><h2>OGAds Offers</h2><button class="close" onclick="loadOgadsOffers()" data-provider="ogads">↻ Refresh</button></div><div class="small" id="ogads-status">Tap the OGAds card above to load offers matched to your device and location.</div><div class="offer-grid" id="ogads-offers-grid"></div></div>';
+ '<div class="card" id="ogads-results-card" data-provider="ogads"><div class="close-row"><h2>OGAds Offers</h2><button class="close" onclick="loadOgadsOffers()" data-provider="ogads">↻ Refresh</button></div><div class="small" id="ogads-status">Tap the OGAds card above to load offers matched to your device and location.</div><div class="offer-grid" id="ogads-offers-grid"></div></div>';
 }
 async function loadOgadsOffers(){
  const status=document.getElementById('ogads-status'),grid=document.getElementById('ogads-offers-grid');
@@ -2518,7 +2530,7 @@ async function loadOgadsOffers(){
  if(!data.offers?.length){status.textContent='No eligible OGAds offers are available for your device or country right now.';return}
  status.textContent=data.offers.length+' offers available. Complete each offer exactly as described.';
  data.offers.forEach(o=>{
-  const card=document.createElement('div');card.className='offer';card.style.cssText='min-height:210px;aspect-ratio:auto;display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:13px;';
+  const card=document.createElement('div');card.className='offer';card.setAttribute('data-provider','ogads');card.style.cssText='min-height:210px;aspect-ratio:auto;display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:13px;';
   if(o.picture){const img=document.createElement('img');img.src=o.picture;img.alt='';img.loading='lazy';img.referrerPolicy='no-referrer';img.style.cssText='width:100%;height:105px;object-fit:cover;border-radius:13px;background:#0a1224;';card.appendChild(img)}
   const title=document.createElement('strong');title.textContent=o.name;card.appendChild(title);
   const payout=document.createElement('div');payout.style.cssText='color:#65f0d2;font-weight:900;font-size:17px';payout.textContent='$'+Number(o.payout||0).toFixed(2)+' payout';card.appendChild(payout);
