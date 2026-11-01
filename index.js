@@ -1971,15 +1971,18 @@ async function adminUsers(request, env) {
 async function publicLiveActivity(request, env) {
   if (request.method !== "GET") return json({ success:false, message:"Method not allowed." },405);
   await ensureSchema(env);
-  // Only confirmed credits are shown. Never expose email, IP, or account identifiers publicly.
+  // Public ticker: confirmed, non-test rewards only. Never expose email, IP, or internal IDs.
   const since = Math.floor(Date.now()/1000) - 24*60*60;
   const rows = await env.DB.prepare(`
-    SELECT offer_name, amount, created_at
-    FROM offerwall_conversions
-    WHERE status='credited' AND created_at>=?
-    ORDER BY id DESC LIMIT 12
+    SELECT c.offer_name, c.amount, c.created_at,
+           COALESCE(NULLIF(TRIM(u.username),''), NULLIF(TRIM(u.first_name),''), 'CoinCove member') AS user_name
+    FROM offerwall_conversions c
+    LEFT JOIN users u ON u.id=c.user_id
+    WHERE c.status='credited' AND c.test=0 AND c.created_at>=? AND c.amount>0
+    ORDER BY c.id DESC LIMIT 30
   `).bind(since).all();
   return json({success:true, activities:(rows.results||[]).map(x=>({
+    user_name:String(x.user_name||'CoinCove member').replace(/^@/,'').slice(0,32),
     offer_name:String(x.offer_name||'an offer').slice(0,90),
     amount:Number(x.amount||0), created_at:Number(x.created_at||0)
   }))});
@@ -2438,16 +2441,16 @@ button,input,select{font:inherit}button{cursor:pointer;transition:transform .18s
 .brand{font-size:26px}.brand span{color:#ffd34e}
 .live-strip{display:flex;align-items:center;gap:11px;min-height:50px;margin:0 0 18px;padding:11px 16px;border:1px solid rgba(24,238,157,.7);border-radius:17px;background:linear-gradient(90deg,rgba(0,195,120,.18),rgba(15,37,68,.95));box-shadow:0 0 22px rgba(0,220,140,.12);font-size:13px;font-weight:800;overflow:hidden}
 .live-dot{width:10px;height:10px;flex:0 0 10px;border-radius:50%;background:#20efa1;box-shadow:0 0 12px #20efa1;animation:livepulse 1.5s infinite}
-.live-copy{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.live-label{color:#39f3a8;letter-spacing:.7px}
+.live-copy{white-space:nowrap;overflow:hidden;min-width:0;flex:1}.live-track{display:block;white-space:nowrap;overflow:hidden;min-width:0;flex:1;mask-image:linear-gradient(90deg,transparent,#000 3%,#000 97%,transparent)}.live-track-inner{display:inline-flex;align-items:center;gap:34px;min-width:max-content;animation:live-marquee 34s linear infinite}.live-track:hover .live-track-inner{animation-play-state:paused}.live-entry{display:inline-flex;align-items:center;gap:7px}.live-entry b{color:#fff}.live-entry strong{color:#42f0a5}.live-separator{color:#6c8bb4;opacity:.8}@keyframes live-marquee{from{transform:translateX(0)}to{transform:translateX(-50%)}}.live-label{color:#39f3a8;letter-spacing:.7px}
 @keyframes livepulse{50%{opacity:.45;box-shadow:0 0 3px #20efa1}}
 .dashboard-hero{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:26px;border-radius:25px;background:linear-gradient(115deg,#0756d9,#1726a9 58%,#2768f0);border:1px solid rgba(116,176,255,.45);box-shadow:0 18px 42px rgba(0,43,160,.25);margin-bottom:17px}
 .dashboard-hero h1{font-size:clamp(24px,4vw,34px);margin:0 0 8px;letter-spacing:-1px}.dashboard-hero p{margin:0;color:#e0eaff}.hero-balance{flex:0 0 auto;padding:14px 18px;border-radius:19px;background:linear-gradient(135deg,#7027dc,#3925b9);border:1px solid rgba(255,255,255,.22);font-weight:900;text-align:center}.hero-balance b{display:block;font-size:23px;color:#fff}.hero-art{font-size:56px;filter:drop-shadow(0 8px 12px #07194e66)}
 .dashboard-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin-bottom:17px}.dashboard-stat{padding:19px;border-radius:21px;border:1px solid rgba(255,255,255,.18);box-shadow:0 12px 24px #0002}.dashboard-stat:nth-child(1){background:linear-gradient(145deg,#0879f2,#0646c4)}.dashboard-stat:nth-child(2){background:linear-gradient(145deg,#08bd67,#078a56)}.dashboard-stat:nth-child(3){background:linear-gradient(145deg,#ffad05,#f05a0b)}.dashboard-stat:nth-child(4){background:linear-gradient(145deg,#9d28ed,#5b19c9)}.dashboard-stat span{display:block;font-size:12px;color:#fffde7}.dashboard-stat b{display:block;font-size:clamp(20px,2.7vw,27px);margin:8px 0 2px}.dashboard-stat small{opacity:.85}
 .dashboard-section{padding:21px;border:1px solid rgba(133,158,255,.2);border-radius:23px;background:linear-gradient(145deg,rgba(17,28,65,.96),rgba(11,17,42,.98));margin-bottom:17px;box-shadow:0 16px 38px #0002}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:15px}.section-heading h2{margin:0;font-size:21px}.provider-preview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.provider-tile{min-width:0;padding:17px 12px;border-radius:19px;background:linear-gradient(145deg,#f7f9ff,#dce7ff);color:#111b36;text-align:center;border:1px solid #fff;box-shadow:0 9px 18px #0002}.provider-tile strong{display:block;font-size:16px;margin:8px 0}.provider-tile .provider-icon{font-size:31px}.provider-tile button{width:100%;border:0;border-radius:12px;padding:10px 7px;background:linear-gradient(100deg,#1766ff,#1743d4);color:white;font-weight:850}
 .dashboard-columns{display:grid;grid-template-columns:1fr 1fr;gap:16px}.progress-track{height:12px;border-radius:20px;background:#0a1640;overflow:hidden;margin-top:12px}.progress-track i{display:block;height:100%;width:68%;border-radius:20px;background:linear-gradient(90deg,#18d8a1,#2c9bff)}.daily-panel{text-align:center;background:radial-gradient(circle at 50% 40%,rgba(255,184,45,.18),transparent 48%),linear-gradient(145deg,#25176a,#15194a)}.daily-gift{font-size:56px;margin:12px}.recent-item{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid rgba(160,180,255,.12)}.recent-item:last-child{border-bottom:0}.recent-symbol{width:34px;height:34px;display:grid;place-items:center;border-radius:12px;background:rgba(31,223,158,.14)}.recent-item .small{font-size:11px}.recent-amount{margin-left:auto;color:#3ff0b0;font-weight:900;white-space:nowrap}
-.site-legal{position:relative;z-index:2;display:flex;justify-content:center;align-items:center;gap:20px;flex-wrap:wrap;padding:22px 16px 110px;border-top:1px solid rgba(143,166,255,.12);color:#62e8d1}.site-legal a{color:#65e9d2;text-decoration:none;font-weight:800;font-size:13px}.site-legal a:hover{color:#fff}
+.site-legal{position:relative;z-index:2;display:flex;justify-content:center;align-items:center;gap:20px;flex-wrap:wrap;padding:22px 16px 105px;border-top:1px solid rgba(143,166,255,.12);color:#62e8d1}.site-legal a{color:#65e9d2;text-decoration:none;font-weight:800;font-size:13px}.site-legal a:hover{color:#fff}
 @media(max-width:700px){.dashboard-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.provider-preview{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-columns{grid-template-columns:1fr}.dashboard-hero{padding:20px;flex-wrap:wrap}.hero-art{font-size:42px}.hero-balance{margin-left:auto}.wrap{padding-left:12px;padding-right:12px}.dashboard-section{padding:16px}}
-@media(max-width:390px){.dashboard-stat{padding:14px}.provider-tile{padding:14px 9px}.live-strip{font-size:11px}.hero-balance{padding:11px 13px}}
+@media(max-width:390px){.dashboard-stat{padding:14px}.provider-tile{padding:14px 9px}.live-strip{font-size:11px}.live-track-inner{animation-duration:27s}.hero-balance{padding:11px 13px}}
 </style>
 </head>
 <body>
@@ -2517,40 +2520,44 @@ function render(){
     '<div class="top"><div><div class="brand">🌊 Coin<span>Cove</span></div><div class="small">Earn Coins · Complete Offers · Get Rewards</div></div><button class="close" onclick="logout()">Log out</button></div>'+
     (page==='home'?homePage(balance):page==='offers'?offersPage():page==='withdraw'?withdrawPage(balance):accountPage())+
   '</div>'+
-  '<footer class="site-legal"><a href="/privacy">♧ Privacy Policy</a><span>·</span><a href="/terms">▤ Terms of Service</a><span>·</span><a href="/support">♧ Support</a></footer>'+
+  '<footer id="site-legal" class="site-legal"><a href="/privacy">♧ Privacy Policy</a><span>·</span><a href="/terms">▤ Terms of Service</a><span>·</span><a href="/support">♧ Support</a></footer>'+
   '<div class="nav"><div class="navin">'+
     '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">🏠<br>Home</button>'+
     '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">🎁<br>Offers</button>'+
     '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">💸<br>Withdraw</button>'+
     '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">👤<br>Account</button>'+
   '</div></div>';
+  document.querySelectorAll('footer.site-legal').forEach((node,i)=>{if(i>0)node.remove();});
   applyProviderVisibility();
   if(page==='home'){loadLiveActivity();}
 }
 let liveActivityItems=[];
 let liveActivityTimer=null;
-async function loadLiveActivity(){
-  const box=document.getElementById('live-activity-text');
-  try{
-    const d=await api('/api/live-activity');
-    if(d?.success&&Array.isArray(d.activities))liveActivityItems=d.activities;
-  }catch(e){console.warn('Live activity unavailable',e)}
+function paintLiveActivity(){
   const el=document.getElementById('live-activity-text');
-  if(el){
-    if(liveActivityItems.length){
-      const x=liveActivityItems[0];
-      el.textContent='A CoinCove member completed '+(x.offer_name||'an offer')+' and earned '+Number(x.amount||0).toLocaleString()+' Coins';
-    }else el.textContent='Live rewards appear here after an offer is confirmed';
+  if(!el)return;
+  if(!liveActivityItems.length){el.textContent='New confirmed offer rewards will appear here';return;}
+  const entries=liveActivityItems.map(x=>'<span class="live-entry"><b>'+esc(x.user_name||'CoinCove member')+'</b> completed <b>'+esc(x.offer_name||'an offer')+'</b> and earned <strong>'+Number(x.amount||0).toLocaleString()+' Coins</strong></span>');
+  const sequence=entries.concat(entries).join('<span class="live-separator">✦</span>');
+  el.innerHTML='<span class="live-track-inner">'+sequence+'</span>';
+}
+async function loadLiveActivity(){
+  if(liveActivityTimer){clearInterval(liveActivityTimer);liveActivityTimer=null;}
+  const el=document.getElementById('live-activity-text');
+  if(el)el.textContent='Loading confirmed offer activity…';
+  async function refresh(){
+    try{
+      const d=await api('/api/live-activity');
+      if(d?.success&&Array.isArray(d.activities)){
+        liveActivityItems=d.activities;
+        paintLiveActivity();
+      }
+    }catch(e){console.warn('Live activity unavailable',e)}
   }
-  if(liveActivityTimer)clearInterval(liveActivityTimer);
-  liveActivityTimer=setInterval(async()=>{
-    const d=await api('/api/live-activity');
-    if(d?.success&&Array.isArray(d.activities)){
-      liveActivityItems=d.activities;
-      const el=document.getElementById('live-activity-text');
-      if(el&&liveActivityItems.length){const x=liveActivityItems[0];el.textContent='A CoinCove member completed '+(x.offer_name||'an offer')+' and earned '+Number(x.amount||0).toLocaleString()+' Coins'}
-    }
-  },30000);
+  await refresh();
+  if(document.getElementById('live-activity-text')){
+    liveActivityTimer=setInterval(refresh,20000);
+  }
 }
 function homePage(balance){
  const tx=state.transactions||[];
