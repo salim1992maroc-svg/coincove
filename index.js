@@ -84,6 +84,7 @@ export default {
       }
 
       if (url.pathname === "/api/providers/visible") return publicProviderVisibility(request, env);
+      if (url.pathname === "/api/live-activity") return publicLiveActivity(request, env);
       if (url.pathname === "/api/me") return apiMe(request, env);
       if (url.pathname === "/api/referral") return apiReferral(request, env);
       if (url.pathname === "/api/reward-ad") return rewardAd(request, env);
@@ -1967,6 +1968,23 @@ async function adminUsers(request, env) {
   return json({ success: true, users: r.results || [] });
 }
 
+async function publicLiveActivity(request, env) {
+  if (request.method !== "GET") return json({ success:false, message:"Method not allowed." },405);
+  await ensureSchema(env);
+  // Only confirmed credits are shown. Never expose email, IP, or account identifiers publicly.
+  const since = Math.floor(Date.now()/1000) - 24*60*60;
+  const rows = await env.DB.prepare(`
+    SELECT offer_name, amount, created_at
+    FROM offerwall_conversions
+    WHERE status='credited' AND created_at>=?
+    ORDER BY id DESC LIMIT 12
+  `).bind(since).all();
+  return json({success:true, activities:(rows.results||[]).map(x=>({
+    offer_name:String(x.offer_name||'an offer').slice(0,90),
+    amount:Number(x.amount||0), created_at:Number(x.created_at||0)
+  }))});
+}
+
 async function publicProviderVisibility(request, env) {
   await ensureSchema(env);
   const rows=await env.DB.prepare("SELECT provider_key,enabled FROM provider_settings").all();
@@ -2413,6 +2431,23 @@ button,input,select{font:inherit}button{cursor:pointer;transition:transform .18s
 @media(min-width:600px){.wrap{padding-top:32px}.wrap>.card:nth-of-type(2){padding:32px}.actions{gap:14px}.navin{padding:12px 18px}}
 @media(max-width:430px){.offer-grid{gap:10px}.offer-grid .offer{min-height:158px;padding:14px;border-radius:19px}.offer-grid .offer strong{font-size:16px;margin:10px 0 7px}.offer-grid .offer .small{font-size:11px}.wrap{padding:15px 12px calc(105px + env(safe-area-inset-bottom))}.top{margin-bottom:18px}.brand,.top .brand{font-size:21px}.card{padding:18px;border-radius:23px;margin-bottom:13px}.wrap>.card:nth-of-type(2){padding:21px;min-height:250px}.balance{font-size:39px;letter-spacing:-1.8px}.stat{padding:13px;border-radius:16px}.stat b{font-size:20px}.title{font-size:18px;margin-bottom:15px}.btn{padding:15px 13px;font-size:14px}.navin{gap:4px;padding:8px 8px 7px}.nav button{font-size:11px;border-radius:14px}.offer{padding:16px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+
+/* CoinCove refreshed dashboard */
+.wrap{max-width:1120px;padding-top:18px}
+.top{padding:12px 16px;border:1px solid rgba(126,157,255,.16);border-radius:22px;background:rgba(9,16,39,.78);box-shadow:0 12px 32px rgba(0,0,0,.22)}
+.brand{font-size:26px}.brand span{color:#ffd34e}
+.live-strip{display:flex;align-items:center;gap:11px;min-height:50px;margin:0 0 18px;padding:11px 16px;border:1px solid rgba(24,238,157,.7);border-radius:17px;background:linear-gradient(90deg,rgba(0,195,120,.18),rgba(15,37,68,.95));box-shadow:0 0 22px rgba(0,220,140,.12);font-size:13px;font-weight:800;overflow:hidden}
+.live-dot{width:10px;height:10px;flex:0 0 10px;border-radius:50%;background:#20efa1;box-shadow:0 0 12px #20efa1;animation:livepulse 1.5s infinite}
+.live-copy{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.live-label{color:#39f3a8;letter-spacing:.7px}
+@keyframes livepulse{50%{opacity:.45;box-shadow:0 0 3px #20efa1}}
+.dashboard-hero{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:26px;border-radius:25px;background:linear-gradient(115deg,#0756d9,#1726a9 58%,#2768f0);border:1px solid rgba(116,176,255,.45);box-shadow:0 18px 42px rgba(0,43,160,.25);margin-bottom:17px}
+.dashboard-hero h1{font-size:clamp(24px,4vw,34px);margin:0 0 8px;letter-spacing:-1px}.dashboard-hero p{margin:0;color:#e0eaff}.hero-balance{flex:0 0 auto;padding:14px 18px;border-radius:19px;background:linear-gradient(135deg,#7027dc,#3925b9);border:1px solid rgba(255,255,255,.22);font-weight:900;text-align:center}.hero-balance b{display:block;font-size:23px;color:#fff}.hero-art{font-size:56px;filter:drop-shadow(0 8px 12px #07194e66)}
+.dashboard-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin-bottom:17px}.dashboard-stat{padding:19px;border-radius:21px;border:1px solid rgba(255,255,255,.18);box-shadow:0 12px 24px #0002}.dashboard-stat:nth-child(1){background:linear-gradient(145deg,#0879f2,#0646c4)}.dashboard-stat:nth-child(2){background:linear-gradient(145deg,#08bd67,#078a56)}.dashboard-stat:nth-child(3){background:linear-gradient(145deg,#ffad05,#f05a0b)}.dashboard-stat:nth-child(4){background:linear-gradient(145deg,#9d28ed,#5b19c9)}.dashboard-stat span{display:block;font-size:12px;color:#fffde7}.dashboard-stat b{display:block;font-size:clamp(20px,2.7vw,27px);margin:8px 0 2px}.dashboard-stat small{opacity:.85}
+.dashboard-section{padding:21px;border:1px solid rgba(133,158,255,.2);border-radius:23px;background:linear-gradient(145deg,rgba(17,28,65,.96),rgba(11,17,42,.98));margin-bottom:17px;box-shadow:0 16px 38px #0002}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:15px}.section-heading h2{margin:0;font-size:21px}.provider-preview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.provider-tile{min-width:0;padding:17px 12px;border-radius:19px;background:linear-gradient(145deg,#f7f9ff,#dce7ff);color:#111b36;text-align:center;border:1px solid #fff;box-shadow:0 9px 18px #0002}.provider-tile strong{display:block;font-size:16px;margin:8px 0}.provider-tile .provider-icon{font-size:31px}.provider-tile button{width:100%;border:0;border-radius:12px;padding:10px 7px;background:linear-gradient(100deg,#1766ff,#1743d4);color:white;font-weight:850}
+.dashboard-columns{display:grid;grid-template-columns:1fr 1fr;gap:16px}.progress-track{height:12px;border-radius:20px;background:#0a1640;overflow:hidden;margin-top:12px}.progress-track i{display:block;height:100%;width:68%;border-radius:20px;background:linear-gradient(90deg,#18d8a1,#2c9bff)}.daily-panel{text-align:center;background:radial-gradient(circle at 50% 40%,rgba(255,184,45,.18),transparent 48%),linear-gradient(145deg,#25176a,#15194a)}.daily-gift{font-size:56px;margin:12px}.recent-item{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid rgba(160,180,255,.12)}.recent-item:last-child{border-bottom:0}.recent-symbol{width:34px;height:34px;display:grid;place-items:center;border-radius:12px;background:rgba(31,223,158,.14)}.recent-item .small{font-size:11px}.recent-amount{margin-left:auto;color:#3ff0b0;font-weight:900;white-space:nowrap}
+.site-legal{position:relative;z-index:2;display:flex;justify-content:center;align-items:center;gap:20px;flex-wrap:wrap;padding:22px 16px 110px;border-top:1px solid rgba(143,166,255,.12);color:#62e8d1}.site-legal a{color:#65e9d2;text-decoration:none;font-weight:800;font-size:13px}.site-legal a:hover{color:#fff}
+@media(max-width:700px){.dashboard-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.provider-preview{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-columns{grid-template-columns:1fr}.dashboard-hero{padding:20px;flex-wrap:wrap}.hero-art{font-size:42px}.hero-balance{margin-left:auto}.wrap{padding-left:12px;padding-right:12px}.dashboard-section{padding:16px}}
+@media(max-width:390px){.dashboard-stat{padding:14px}.provider-tile{padding:14px 9px}.live-strip{font-size:11px}.hero-balance{padding:11px 13px}}
 </style>
 </head>
 <body>
@@ -2479,9 +2514,10 @@ function render(){
   const w=state.wallet||{},balance=Number(w.balance||0);
   document.getElementById('app').innerHTML=
   '<div class="wrap">'+
-    '<div class="top"><div><div class="brand">🌊 Coin Cove</div><div class="small">Earn Coins and withdraw</div></div><button class="close" onclick="logout()">Log out</button></div>'+
+    '<div class="top"><div><div class="brand">🌊 Coin<span>Cove</span></div><div class="small">Earn Coins · Complete Offers · Get Rewards</div></div><button class="close" onclick="logout()">Log out</button></div>'+
     (page==='home'?homePage(balance):page==='offers'?offersPage():page==='withdraw'?withdrawPage(balance):accountPage())+
   '</div>'+
+  '<footer class="site-legal"><a href="/privacy">♧ Privacy Policy</a><span>·</span><a href="/terms">▤ Terms of Service</a><span>·</span><a href="/support">♧ Support</a></footer>'+
   '<div class="nav"><div class="navin">'+
     '<button class="'+(page==='home'?'active':'')+'" onclick="nav(\'home\')">🏠<br>Home</button>'+
     '<button class="'+(page==='offers'?'active':'')+'" onclick="nav(\'offers\')">🎁<br>Offers</button>'+
@@ -2489,17 +2525,49 @@ function render(){
     '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">👤<br>Account</button>'+
   '</div></div>';
   applyProviderVisibility();
+  if(page==='home'){loadLiveActivity();}
+}
+let liveActivityItems=[];
+let liveActivityTimer=null;
+async function loadLiveActivity(){
+  const box=document.getElementById('live-activity-text');
+  try{
+    const d=await api('/api/live-activity');
+    if(d?.success&&Array.isArray(d.activities))liveActivityItems=d.activities;
+  }catch(e){console.warn('Live activity unavailable',e)}
+  const el=document.getElementById('live-activity-text');
+  if(el){
+    if(liveActivityItems.length){
+      const x=liveActivityItems[0];
+      el.textContent='A CoinCove member completed '+(x.offer_name||'an offer')+' and earned '+Number(x.amount||0).toLocaleString()+' Coins';
+    }else el.textContent='Live rewards appear here after an offer is confirmed';
+  }
+  if(liveActivityTimer)clearInterval(liveActivityTimer);
+  liveActivityTimer=setInterval(async()=>{
+    const d=await api('/api/live-activity');
+    if(d?.success&&Array.isArray(d.activities)){
+      liveActivityItems=d.activities;
+      const el=document.getElementById('live-activity-text');
+      if(el&&liveActivityItems.length){const x=liveActivityItems[0];el.textContent='A CoinCove member completed '+(x.offer_name||'an offer')+' and earned '+Number(x.amount||0).toLocaleString()+' Coins'}
+    }
+  },30000);
 }
 function homePage(balance){
- return '<div class="card"><div class="small">Your balance</div><div class="balance">'+balance.toLocaleString()+' Coins</div><div class="small">≈ $'+money()+'</div><div class="grid" style="margin-top:15px">'+
- '<div class="stat"><span class="small">Lifetime earned</span><b>'+Number(state.wallet.lifetime_earned||0).toLocaleString()+'</b></div>'+
- '<div class="stat"><span class="small">Referrals</span><b>'+Number(state.referrals?.count||0)+'</b></div></div></div>'+
- '<div class="card"><div class="title">Earn more</div><div class="actions">'+
- '<button class="btn" onclick="showTapjoy()" data-provider="tapjoy">⚡ Tapjoy Offerwall</button>'+
- '<button class="btn secondary" onclick="openOffers()">🎁 Other Offerwalls</button>'+
- '<button class="btn good" onclick="watchAd()">▶ Watch rewarded ad</button>'+
- '</div></div>'+
- '<div class="card"><div class="title">Recent activity</div>'+txHtml()+'</div>';
+ const tx=state.transactions||[];
+ const completed=tx.filter(x=>Number(x.amount)>0).length;
+ const lifetime=Number(state.wallet?.lifetime_earned||0);
+ return '<div class="live-strip"><span class="live-dot"></span><span class="live-label">LIVE</span><span class="live-copy" id="live-activity-text">Loading confirmed offer activity…</span></div>'+
+ '<section class="dashboard-hero"><div class="hero-art">🪙</div><div style="flex:1;min-width:180px"><h1>Welcome back!</h1><p>Complete offers, earn points, and enjoy your rewards.</p></div><div class="hero-balance"><b>'+balance.toLocaleString()+'</b><span>Your Coins</span><div class="small">≈ $'+money()+'</div></div></section>'+
+ '<div class="dashboard-stats"><div class="dashboard-stat"><span>👛 Lifetime earned</span><b>'+lifetime.toLocaleString()+'</b><small>Coins earned</small></div><div class="dashboard-stat"><span>✓ Recent rewards</span><b>'+completed+'</b><small>Recent transactions</small></div><div class="dashboard-stat"><span>💵 Wallet value</span><b>$'+money()+'</b><small>Current balance</small></div><div class="dashboard-stat"><span>👥 Referrals</span><b>'+Number(state.referrals?.count||0)+'</b><small>Your invited members</small></div></div>'+
+ '<section class="dashboard-section"><div class="section-heading"><h2>🚀 Top Offerwalls</h2><button class="btn" style="width:auto;padding:10px 15px" onclick="openOffers()">View all offers →</button></div><div class="provider-preview">'+
+ '<div class="provider-tile" data-provider="cpidroid"><div class="provider-icon">🎯</div><strong>CPIDroid</strong><button onclick="openProvider(\'cpidroid\')">Start Offers →</button></div>'+
+ '<div class="provider-tile" data-provider="ogads"><div class="provider-icon">🟣</div><strong>OGAds</strong><button onclick="openOffers();setTimeout(loadOgadsOffers,0)">Start Offers →</button></div>'+
+ '<div class="provider-tile" data-provider="tapjoy"><div class="provider-icon">⚡</div><strong>Tapjoy</strong><button onclick="showTapjoy()">Start Offers →</button></div>'+
+ '<div class="provider-tile" data-provider="bitlabs"><div class="provider-icon">🧪</div><strong>BitLabs</strong><button onclick="openProvider(\'bitlabs\')">Start Offers →</button></div>'+
+ '</div></section>'+
+ '<div class="dashboard-columns"><section class="dashboard-section"><div class="section-heading"><h2>📈 Your Progress</h2><span class="small">Keep earning</span></div><div style="font-size:32px;font-weight:950">'+Math.min(100,Math.round(lifetime/25000*100))+'%</div><div class="small">Progress to 25,000 Coins</div><div class="progress-track"><i style="width:'+Math.min(100,Math.round(lifetime/25000*100))+'%"></i></div><p class="small" style="margin-top:14px">Complete more offers to reach your next reward milestone.</p></section>'+
+ '<section class="dashboard-section daily-panel"><div class="section-heading"><h2>🎁 Daily Reward</h2></div><div class="daily-gift">🎁</div><b>Keep your streak going!</b><p class="small">Visit daily and check available rewards.</p><button class="btn good" onclick="nav(\'offers\')">Explore Rewards</button></section></div>'+
+ '<section class="dashboard-section"><div class="section-heading"><h2>⚡ Recent Activity</h2><span class="small">Your account</span></div>'+txHtml()+'</section>';
 }
 function txHtml(){
  const tx=state.transactions||[];
