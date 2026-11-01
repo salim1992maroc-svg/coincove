@@ -1,5 +1,5 @@
 const APP_NAME = "Coin Cove";
-const BUILD_VERSION = "2026-10-31-ogads-v1";
+const BUILD_VERSION = "2026-11-01-ogads-proxycheck-v2";
 const TAPJOY_SDK_KEY = "277Mt0yeQyuT_sZLoCUE_gEC0KXJGsauFETqGFqtLDz4ZQ0B_sGMBmpWRx1y";
 const TAPJOY_PLACEMENT = "coincover";
 const POINTS_NAME = "Coins";
@@ -30,6 +30,25 @@ export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
+
+      // Block visitors using VPN, proxy, or Tor when ProxyCheck is configured.
+      // Admin endpoints and provider postbacks are intentionally exempt so the owner
+      // can recover access and offerwall callbacks are not rejected.
+      const networkExempt = url.pathname === "/api/health" || url.pathname === "/admin" ||
+        url.pathname.startsWith("/api/admin/") || url.pathname.includes("/postback") ||
+        url.pathname === "/postback/gaintwall" || url.pathname === "/tapjoy/postback" ||
+        url.pathname === "/monetag/postback" || url.pathname === "/api/telegram/webhook" ||
+        (url.pathname === "/" && ["subId", "transId", "reward", "signature"].every(k => url.searchParams.has(k)));
+      if (!networkExempt) {
+        const networkCheck = await checkVisitorNetwork(request, env);
+        if (networkCheck.blocked) {
+          return new Response(renderNetworkBlockedPage(networkCheck.reason), {
+            status: 403,
+            headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" }
+          });
+        }
+      }
+
       if (url.pathname === "/privacy") {
         return new Response(renderLegalPage("privacy"), { headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store" } });
       }
@@ -111,6 +130,86 @@ export default {
     }
   }
 };
+
+async function checkVisitorNetwork(request, env) {
+  const apiKey = String(env.PROXYCHECK_API_KEY || "").trim();
+  // Detection is activated only after the owner adds PROXYCHECK_API_KEY as a Worker Secret.
+  if (!apiKey) return { blocked: false, reason: "not_configured" };
+
+  // Trust only Cloudflare's client-IP header; never trust arbitrary X-Forwarded-For.
+  const ip = String(request.headers.get("CF-Connecting-IP") || "").trim();
+  if (!ip || ip.length > 64) return { blocked: false, reason: "ip_unavailable" };
+
+  const cacheKey = new Request("https://coin-cove-proxycheck-cache.invalid/" + encodeURIComponent(ip));
+  try {
+    if (typeof caches !== "undefined" && caches.default) {
+      const cached = await caches.default.match(cacheKey);
+      if (cached) {
+        const result = await cached.json();
+        return { blocked: !!result.blocked, reason: result.reason || "cached_detection" };
+      }
+    }
+  } catch (e) {
+    console.warn("ProxyCheck cache read failed:", e);
+  }
+
+  try {
+    // ProxyCheck v2 is the documented stable endpoint and supports the free API key.
+    // vpn=1 checks both proxy and VPN; the response also identifies TOR/OpenVPN types.
+    const endpoint = new URL("https://proxycheck.io/v2/" + encodeURIComponent(ip));
+    endpoint.searchParams.set("key", apiKey);
+    endpoint.searchParams.set("vpn", "1");
+    endpoint.searchParams.set("tag", "CoinCove");
+
+    const response = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: { "accept": "application/json" },
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!response.ok) throw new Error("ProxyCheck HTTP " + response.status);
+    const data = await response.json();
+    if (!data || !["ok", "warning"].includes(String(data.status || "").toLowerCase())) {
+      throw new Error("ProxyCheck lookup was unsuccessful");
+    }
+
+    // v2 returns the result under the queried IP address.
+    const record = data[ip] || Object.entries(data).find(([key, value]) =>
+      key !== "status" && key !== "query time" && value && typeof value === "object"
+    )?.[1];
+    if (!record || typeof record !== "object") throw new Error("ProxyCheck response had no IP result");
+
+    const proxy = String(record.proxy || "").toLowerCase() === "yes";
+    const type = String(record.type || "").toLowerCase();
+    const reasons = [];
+    if (type === "vpn") reasons.push("VPN");
+    if (proxy && !reasons.includes("VPN")) reasons.push("Proxy");
+    if (type === "tor") reasons.push("Tor");
+    if (type === "openvpn") reasons.push("OpenVPN");
+
+    const blocked = reasons.length > 0;
+    const result = { blocked, reason: blocked ? reasons.join(", ") : "clear" };
+
+    try {
+      if (typeof caches !== "undefined" && caches.default) {
+        await caches.default.put(cacheKey, new Response(JSON.stringify(result), {
+          headers: { "content-type": "application/json", "cache-control": "public, max-age=900" }
+        }));
+      }
+    } catch (e) {
+      console.warn("ProxyCheck cache write failed:", e);
+    }
+    return result;
+  } catch (e) {
+    // Fail open on provider/network errors to avoid accidentally locking out all visitors.
+    console.error("ProxyCheck network check failed:", e);
+    return { blocked: false, reason: "check_unavailable" };
+  }
+}
+
+function renderNetworkBlockedPage(reason) {
+  const detail = String(reason || "VPN, Proxy, or Tor connection").replace(/[<>]/g, "");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Access Restricted — Coin Cove</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;box-sizing:border-box;background:#071126;color:#f4f7ff;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.card{max-width:520px;padding:32px;border:1px solid rgba(106,151,255,.25);border-radius:24px;background:#102044;text-align:center;box-shadow:0 20px 60px #0005}h1{font-size:27px;margin:0 0 14px}p{color:#b8c7e8;line-height:1.7}.icon{font-size:48px;margin-bottom:14px}.small{font-size:13px;color:#8499c5}</style></head><body><main class="card"><div class="icon">🛡️</div><h1>Access Restricted</h1><p>Coin Cove does not allow access through VPN, proxy, or Tor connections. Please turn off your VPN or proxy and try again using your normal internet connection.</p><p class="small">Connection classification: ${detail}</p></main></body></html>`;
+}
 
 async function readPostbackParams(request) {
   const u = new URL(request.url);
