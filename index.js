@@ -1,5 +1,5 @@
 const APP_NAME = "Coin Cove";
-const BUILD_VERSION = "2026-11-01-proxycheck-admin-audit-v1";
+const BUILD_VERSION = "2026-11-01-proxycheck-email-auth-enforcement-v2";
 const TAPJOY_SDK_KEY = "277Mt0yeQyuT_sZLoCUE_gEC0KXJGsauFETqGFqtLDz4ZQ0B_sGMBmpWRx1y";
 const TAPJOY_PLACEMENT = "coincover";
 const POINTS_NAME = "Coins";
@@ -31,21 +31,31 @@ export default {
     try {
       const url = new URL(request.url);
 
-      // Block visitors using VPN, proxy, or Tor when ProxyCheck is configured.
-      // Admin endpoints and provider postbacks are intentionally exempt so the owner
-      // can recover access and offerwall callbacks are not rejected.
+      // VPN/proxy enforcement is account-aware for email/password users.
+      // Let visitors reach registration/login first; those handlers validate credentials,
+      // then run the network check with the known user ID before issuing a session.
+      // Telegram users are intentionally not part of this enforcement flow.
       const networkExempt = url.pathname === "/api/health" || url.pathname === "/admin" ||
+        url.pathname === "/api/auth/register" || url.pathname === "/api/auth/login" ||
+        url.pathname === "/api/auth/logout" || url.pathname === "/api/auth/me" ||
         url.pathname.startsWith("/api/admin/") || url.pathname.includes("/postback") ||
         url.pathname === "/postback/gaintwall" || url.pathname === "/tapjoy/postback" ||
         url.pathname === "/monetag/postback" || url.pathname === "/api/telegram/webhook" ||
+        url.pathname === "/api/me" ||
         (url.pathname === "/" && ["subId", "transId", "reward", "signature"].every(k => url.searchParams.has(k)));
       if (!networkExempt) {
-        const networkCheck = await checkVisitorNetwork(request, env);
-        if (networkCheck.blocked) {
-          return new Response(renderNetworkBlockedPage(networkCheck.reason), {
-            status: 403,
-            headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" }
-          });
+        const identity = await resolveUserAuth(request, env);
+        if (identity?.auth === "email") {
+          const account = await dbUserByDatabaseId(env.DB, identity.userId);
+          const networkCheck = await checkVisitorNetwork(request, env, account);
+          if (networkCheck.blocked) {
+            // Revoke all email sessions for this account so a blocked user is logged out.
+            await env.DB.prepare("DELETE FROM email_sessions WHERE user_id=?").bind(identity.userId).run();
+            return new Response(renderNetworkBlockedPage(networkCheck.reason), {
+              status: 403,
+              headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" }
+            });
+          }
         }
       }
 
@@ -132,7 +142,7 @@ export default {
   }
 };
 
-async function checkVisitorNetwork(request, env) {
+async function checkVisitorNetwork(request, env, knownUser = null) {
   const apiKey = String(env.PROXYCHECK_API_KEY || "").trim();
   // Detection is activated only after the owner adds PROXYCHECK_API_KEY as a Worker Secret.
   if (!apiKey) return { blocked: false, reason: "not_configured" };
@@ -147,6 +157,7 @@ async function checkVisitorNetwork(request, env) {
       const cached = await caches.default.match(cacheKey);
       if (cached) {
         const result = await cached.json();
+        if (result.blocked) await logNetworkSecurityEvent(env, request, ip, result.reason || "cached_detection", knownUser);
         return { blocked: !!result.blocked, reason: result.reason || "cached_detection" };
       }
     }
@@ -192,23 +203,7 @@ async function checkVisitorNetwork(request, env) {
 
     // Record blocked attempts for the admin dashboard. Resolve an account only
     // when a valid email session or Telegram initData is present.
-    if (blocked && env.DB) {
-      try {
-        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS network_security_events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, public_id TEXT, email TEXT,
-          ip TEXT NOT NULL, detection_type TEXT NOT NULL, blocked INTEGER NOT NULL DEFAULT 1,
-          created_at INTEGER NOT NULL
-        )`).run();
-        const identity = await resolveUserAuth(request, env);
-        let user = identity ? await dbUserByDatabaseId(env.DB, identity.userId) : null;
-        await env.DB.prepare(`
-          INSERT INTO network_security_events(user_id,public_id,email,ip,detection_type,blocked,created_at)
-          VALUES(?,?,?,?,?,1,?)
-        `).bind(user?.id || null, user?.public_id || null, user?.email || null, ip, result.reason, Date.now()).run();
-      } catch (logError) {
-        console.error("Network security event logging failed:", logError);
-      }
-    }
+    if (blocked) await logNetworkSecurityEvent(env, request, ip, result.reason, knownUser);
 
     try {
       if (typeof caches !== "undefined" && caches.default) {
@@ -224,6 +219,29 @@ async function checkVisitorNetwork(request, env) {
     // Fail open on provider/network errors to avoid accidentally locking out all visitors.
     console.error("ProxyCheck network check failed:", e);
     return { blocked: false, reason: "check_unavailable" };
+  }
+}
+
+
+async function logNetworkSecurityEvent(env, request, ip, detectionType, knownUser = null) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS network_security_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, public_id TEXT, email TEXT,
+      ip TEXT NOT NULL, detection_type TEXT NOT NULL, blocked INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL
+    )`).run();
+    let user = knownUser;
+    if (!user) {
+      const identity = await resolveUserAuth(request, env);
+      user = identity ? await dbUserByDatabaseId(env.DB, identity.userId) : null;
+    }
+    await env.DB.prepare(`
+      INSERT INTO network_security_events(user_id,public_id,email,ip,detection_type,blocked,created_at)
+      VALUES(?,?,?,?,?,1,?)
+    `).bind(user?.id || null, user?.public_id || null, user?.email || null, ip, detectionType, Date.now()).run();
+  } catch (logError) {
+    console.error("Network security event logging failed:", logError);
   }
 }
 
@@ -1693,6 +1711,10 @@ async function emailRegister(request, env) {
     return json({ success: false, message: "Unable to create the account. Please try again." }, 500);
   }
 
+  const networkCheck = await checkVisitorNetwork(request, env, user);
+  if (networkCheck.blocked) {
+    return json({ success: false, code: "NETWORK_BLOCKED", message: "VPN, Proxy, and Tor connections are not allowed. Turn off your VPN or proxy and try again." }, 403);
+  }
   const token = await createSession(env.DB, user.id);
   return userPayload(env.DB, user.id, { auth: "email", sessionCreated: true, token });
 }
@@ -1713,6 +1735,13 @@ async function emailLogin(request, env) {
     return json({ success: false, message: "Invalid email or password." }, 401);
   }
 
+  const account = await dbUserByDatabaseId(env.DB, row.user_id);
+  const networkCheck = await checkVisitorNetwork(request, env, account);
+  if (networkCheck.blocked) {
+    // Revoke any previous email sessions as well; do not issue a new one.
+    await env.DB.prepare("DELETE FROM email_sessions WHERE user_id=?").bind(row.user_id).run();
+    return json({ success: false, code: "NETWORK_BLOCKED", message: "VPN, Proxy, and Tor connections are not allowed. Turn off your VPN or proxy and try again." }, 403);
+  }
   const token = await createSession(env.DB, row.user_id);
   return userPayload(env.DB, row.user_id, { auth: "email", sessionCreated: true, token });
 }
