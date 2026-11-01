@@ -1,5 +1,5 @@
 const APP_NAME = "Coin Cove";
-const BUILD_VERSION = "2026-11-01-proxycheck-email-auth-enforcement-v2";
+const BUILD_VERSION = "2026-11-01-coincove-pro-admin-v1";
 const TAPJOY_SDK_KEY = "277Mt0yeQyuT_sZLoCUE_gEC0KXJGsauFETqGFqtLDz4ZQ0B_sGMBmpWRx1y";
 const TAPJOY_PLACEMENT = "coincover";
 const POINTS_NAME = "Coins";
@@ -83,6 +83,7 @@ export default {
         });
       }
 
+      if (url.pathname === "/api/providers/visible") return publicProviderVisibility(request, env);
       if (url.pathname === "/api/me") return apiMe(request, env);
       if (url.pathname === "/api/referral") return apiReferral(request, env);
       if (url.pathname === "/api/reward-ad") return rewardAd(request, env);
@@ -113,6 +114,9 @@ export default {
       if (url.pathname === "/api/admin/logout") return adminLogout(request, env);
       if (url.pathname === "/api/admin/me") return adminMe(request, env);
       if (url.pathname === "/api/admin/users") return adminUsers(request, env);
+      if (url.pathname === "/api/admin/overview") return adminOverview(request, env);
+      if (url.pathname === "/api/admin/providers") return adminProviders(request, env);
+      if (url.pathname === "/api/admin/user-detail") return adminUserDetail(request, env);
       if (url.pathname === "/api/admin/network-events") return adminNetworkEvents(request, env);
       if (url.pathname === "/api/admin/withdrawals") return adminWithdrawals(request, env);
       if (url.pathname === "/api/admin/withdrawal") return adminWithdrawalAction(request, env);
@@ -874,6 +878,7 @@ async function initSchema(db) {
     `CREATE TABLE IF NOT EXISTS admin_users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, created_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS admin_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS network_security_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, public_id TEXT, email TEXT, ip TEXT NOT NULL, detection_type TEXT NOT NULL, blocked INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS provider_settings (provider_key TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS idx_network_events_created ON network_security_events(created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_network_events_ip ON network_security_events(ip,created_at)`,
     `CREATE TABLE IF NOT EXISTS withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, method TEXT NOT NULL, destination TEXT NOT NULL, coins INTEGER NOT NULL, usd_cents INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, admin_note TEXT)`,
@@ -1962,6 +1967,61 @@ async function adminUsers(request, env) {
   return json({ success: true, users: r.results || [] });
 }
 
+async function publicProviderVisibility(request, env) {
+  await ensureSchema(env);
+  const rows=await env.DB.prepare("SELECT provider_key,enabled FROM provider_settings").all();
+  const saved=new Map((rows.results||[]).map(x=>[x.provider_key,Number(x.enabled)!==0]));
+  return json({success:true,providers:Object.fromEntries(ADMIN_PROVIDERS.map(([key])=>[key,saved.has(key)?saved.get(key):true]))});
+}
+
+async function adminOverview(request, env) {
+  if (request.method !== "GET") return json({ success:false, message:"Method not allowed." },405);
+  await ensureSchema(env);
+  if (!(await adminSession(env.DB, request))) return json({ success:false, message:"Not authenticated." },401);
+  const [u,t,w,n,tx] = await Promise.all([
+    env.DB.prepare("SELECT COUNT(*) total FROM users").first(),
+    env.DB.prepare("SELECT COUNT(*) total FROM offerwall_conversions WHERE status='credited'").first().catch(()=>({total:0})),
+    env.DB.prepare("SELECT COALESCE(SUM(usd_cents),0) total FROM withdrawals WHERE status='approved'").first(),
+    env.DB.prepare("SELECT COUNT(*) total FROM network_security_events WHERE blocked=1").first(),
+    env.DB.prepare(`SELECT t.id,t.user_id,u.public_id,u.email,t.type,t.amount,t.description,t.created_at FROM transactions t LEFT JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 8`).all()
+  ]);
+  return json({success:true,stats:{users:Number(u?.total||0),offers:Number(t?.total||0),withdrawnUsd:(Number(w?.total||0)/100).toFixed(2),blocked:Number(n?.total||0)},activities:tx.results||[]});
+}
+
+const ADMIN_PROVIDERS = [
+  ["tapjoy","Tapjoy","Offerwall"],["ogads","OGAds","Offerwall"],["cpidroid","CPIDroid","CPA Offers"],
+  ["notik","Notik","Offerwall"],["admantum","AdMantum","Offerwall"],["offerwallgg","Offerwall.GG","Offerwall"],
+  ["adswed","AdswedMedia","Offerwall"],["offerme","Offerwall.me","Offerwall"],["gaintwall","Gaintwall","Offerwall"],["bitlabs","BitLabs","Offers & Surveys"]
+];
+async function adminProviders(request, env) {
+  await ensureSchema(env);
+  if (!(await adminSession(env.DB, request))) return json({success:false,message:"Not authenticated."},401);
+  if (request.method === "GET") {
+    const rows=await env.DB.prepare("SELECT provider_key,enabled FROM provider_settings").all();
+    const saved=new Map((rows.results||[]).map(x=>[x.provider_key,Number(x.enabled)!==0]));
+    return json({success:true,providers:ADMIN_PROVIDERS.map(([key,name,type])=>({key,name,type,enabled:saved.has(key)?saved.get(key):true}))});
+  }
+  if (request.method === "POST") {
+    let b;try{b=await request.json()}catch{return json({success:false,message:"Invalid JSON."},400)}
+    const key=String(b?.key||""); if(!ADMIN_PROVIDERS.some(x=>x[0]===key)||typeof b?.enabled!=="boolean") return json({success:false,message:"Invalid provider setting."},400);
+    await env.DB.prepare(`INSERT INTO provider_settings(provider_key,enabled,updated_at) VALUES(?,?,?) ON CONFLICT(provider_key) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at`).bind(key,b.enabled?1:0,Math.floor(Date.now()/1000)).run();
+    return json({success:true});
+  }
+  return json({success:false,message:"Method not allowed."},405);
+}
+async function adminUserDetail(request, env) {
+  if(request.method!=="GET") return json({success:false,message:"Method not allowed."},405);
+  await ensureSchema(env); if(!(await adminSession(env.DB,request))) return json({success:false,message:"Not authenticated."},401);
+  const id=Number(new URL(request.url).searchParams.get("id")); if(!Number.isInteger(id)||id<1)return json({success:false,message:"Invalid user."},400);
+  const user=await env.DB.prepare(`SELECT u.id,u.public_id,u.email,u.telegram_id,u.username,u.created_at,COALESCE(w.balance,0) balance,COALESCE(w.lifetime_earned,0) lifetime_earned,COALESCE(w.lifetime_withdrawn,0) lifetime_withdrawn FROM users u LEFT JOIN wallets w ON w.user_id=u.id WHERE u.id=?`).bind(id).first();
+  if(!user)return json({success:false,message:"User not found."},404);
+  const [tx,conv]=await Promise.all([
+    env.DB.prepare("SELECT id,type,amount,description,created_at FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 100").bind(id).all(),
+    env.DB.prepare("SELECT offer_id,offer_name,amount,status,payout_usd,created_at FROM offerwall_conversions WHERE user_id=? ORDER BY id DESC LIMIT 100").bind(id).all()
+  ]);
+  return json({success:true,user,transactions:tx.results||[],offers:conv.results||[]});
+}
+
 async function adminNetworkEvents(request, env) {
   if (request.method !== "GET") return json({ success: false, message: "Method not allowed." }, 405);
   await ensureSchema(env);
@@ -2416,13 +2476,14 @@ function render(){
     '<button class="'+(page==='withdraw'?'active':'')+'" onclick="nav(\'withdraw\')">💸<br>Withdraw</button>'+
     '<button class="'+(page==='account'?'active':'')+'" onclick="nav(\'account\')">👤<br>Account</button>'+
   '</div></div>';
+  applyProviderVisibility();
 }
 function homePage(balance){
  return '<div class="card"><div class="small">Your balance</div><div class="balance">'+balance.toLocaleString()+' Coins</div><div class="small">≈ $'+money()+'</div><div class="grid" style="margin-top:15px">'+
  '<div class="stat"><span class="small">Lifetime earned</span><b>'+Number(state.wallet.lifetime_earned||0).toLocaleString()+'</b></div>'+
  '<div class="stat"><span class="small">Referrals</span><b>'+Number(state.referrals?.count||0)+'</b></div></div></div>'+
  '<div class="card"><div class="title">Earn more</div><div class="actions">'+
- '<button class="btn" onclick="showTapjoy()">⚡ Tapjoy Offerwall</button>'+
+ '<button class="btn" onclick="showTapjoy()" data-provider="tapjoy">⚡ Tapjoy Offerwall</button>'+
  '<button class="btn secondary" onclick="openOffers()">🎁 Other Offerwalls</button>'+
  '<button class="btn good" onclick="watchAd()">▶ Watch rewarded ad</button>'+
  '</div></div>'+
@@ -2436,8 +2497,8 @@ function txHtml(){
 function offersPage(){
  return '<div class="card"><h2>Offerwalls</h2><div class="notice">Complete eligible offers. Rewards are credited by each provider after its server callback is received.</div></div>'+
  '<div class="card"><div class="offer-grid">'+
- '<button class="offer" onclick="showTapjoy()"><strong>⚡ Tapjoy</strong><span class="small">Open Tapjoy Web Offerwall</span></button>'+
- '<button class="offer" onclick="loadOgadsOffers()"><strong>🟣 OGAds</strong><span class="small">Browse personalized offers and earn 50% of the payout</span></button>'+
+ '<button class="offer" onclick="showTapjoy()" data-provider="tapjoy"><strong>⚡ Tapjoy</strong><span class="small">Open Tapjoy Web Offerwall</span></button>'+
+ '<button class="offer" onclick="loadOgadsOffers()" data-provider="ogads"><strong>🟣 OGAds</strong><span class="small">Browse personalized offers and earn 50% of the payout</span></button>'+
  '<button class="offer" onclick="openProvider(\'cpidroid\')"><strong>🎯 CPIDroid</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'notik\')"><strong>🎮 Notik</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'admantum\')"><strong>🚀 AdMantum</strong><span class="small">Open provider wall</span></button>'+
@@ -2447,7 +2508,7 @@ function offersPage(){
 '<button class="offer" onclick="openProvider(\'gaintwall\')"><strong>🌟 Gaintwall</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" onclick="openProvider(\'bitlabs\')"><strong>🧪 BitLabs</strong><span class="small">Offers, Games & Surveys</span></button>'+
  '</div></div>'+
- '<div class="card" id="ogads-results-card"><div class="close-row"><h2>OGAds Offers</h2><button class="close" onclick="loadOgadsOffers()">↻ Refresh</button></div><div class="small" id="ogads-status">Tap the OGAds card above to load offers matched to your device and location.</div><div class="offer-grid" id="ogads-offers-grid"></div></div>';
+ '<div class="card" id="ogads-results-card"><div class="close-row"><h2>OGAds Offers</h2><button class="close" onclick="loadOgadsOffers()" data-provider="ogads">↻ Refresh</button></div><div class="small" id="ogads-status">Tap the OGAds card above to load offers matched to your device and location.</div><div class="offer-grid" id="ogads-offers-grid"></div></div>';
 }
 async function loadOgadsOffers(){
  const status=document.getElementById('ogads-status'),grid=document.getElementById('ogads-offers-grid');
@@ -2633,43 +2694,32 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 }
 
 function renderAdmin() {
-  return String.raw`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Cove Admin</title>
-<style>body{font-family:Arial;margin:0;background:#f4f6f9;color:#111827}.wrap{max-width:1100px;margin:auto;padding:20px}.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;overflow:auto;box-shadow:0 5px 18px rgba(0,0,0,.05)}.input,.btn{padding:12px;border-radius:10px;border:1px solid #ddd}.btn{background:#111827;color:#fff;border:0;font-weight:700}.danger{background:#b91c1c}table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}</style></head><body><div class="wrap"><div id="app"><div class="card"><h2>Coin Cove Admin</h2><p>Admin login</p><input id="adminUser" class="input" placeholder="Admin Username" autocomplete="username"><input id="adminPass" class="input" type="password" placeholder="Admin Password" autocomplete="current-password"><button class="btn" style="margin-top:10px" onclick="doLogin()">Login</button><p class="small" style="margin-top:10px">Build 2026-09-24-auth-fix-v5</p></div></div></div>
+ return String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#09122d"><title>CoinCove Admin</title><style>
+:root{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;color:#111b3d;background:#f3f5ff;--navy:#091333;--blue:#1357ed;--muted:#77819d;--line:#e8ebf7;--card:#fff}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#f7f8ff,#eef1ff);min-height:100vh}.shell{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:100vh}.side{background:linear-gradient(180deg,#081333,#111d49);color:#fff;padding:20px 14px;display:flex;flex-direction:column;gap:8px}.logo{text-align:center;padding:4px 4px 22px;border-bottom:1px solid #26345f;margin-bottom:8px}.coin{font-size:38px}.logo b{display:block;font-size:23px}.logo span{color:#aebce8;font-size:12px}.navbtn{border:0;background:transparent;color:#dce4ff;text-align:left;padding:12px 13px;border-radius:12px;font-weight:700;display:flex;gap:12px;align-items:center}.navbtn.active,.navbtn:hover{background:linear-gradient(90deg,#1457ed,#236bf5);color:white}.navbtn i{font-style:normal;width:22px;text-align:center;font-size:17px}.logout{margin-top:auto;background:#e83e5b;color:white}.main{min-width:0;padding:22px 26px 40px}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:22px}.search{width:min(440px,55vw);border:1px solid #dce2f5;border-radius:13px;background:white;padding:13px 16px}.admin{font-weight:800;white-space:nowrap}.pagehead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 18px}.pagehead h1{font-size:25px;margin:0}.sub{color:var(--muted);font-size:13px;margin-top:5px}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:17px}.stat{border-radius:17px;padding:18px;color:white;box-shadow:0 10px 25px #1d3e821c}.stat:nth-child(1){background:linear-gradient(130deg,#168bff,#1254e8)}.stat:nth-child(2){background:linear-gradient(130deg,#25c98b,#0aa86e)}.stat:nth-child(3){background:linear-gradient(130deg,#ffbf21,#ff8515)}.stat:nth-child(4){background:linear-gradient(130deg,#a34cf4,#5926d6)}.stat label{font-size:12px;opacity:.9}.stat strong{display:block;font-size:27px;margin-top:7px}.layout{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(340px,.9fr);gap:15px}.card{background:var(--card);border:1px solid #e8ebf8;border-radius:17px;padding:18px;box-shadow:0 7px 25px #182a6410;min-width:0;margin-bottom:15px}.cardhead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:14px}.card h2{font-size:16px;margin:0}.btn{border:0;border-radius:10px;padding:9px 13px;background:#1559ed;color:#fff;font-weight:750;cursor:pointer}.btn.light{background:#f0f3ff;color:#1649ce;border:1px solid #dce4ff}.btn.red{background:#fff0f2;color:#d62e4d}.tablewrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid #edf0f8;white-space:nowrap}th{color:#56617e;font-size:12px;background:#fafbff}.pill{display:inline-block;padding:5px 9px;border-radius:30px;background:#e5faef;color:#09854d;font-size:11px;font-weight:800}.pill.off{background:#fff0f2;color:#cf3150}.provider{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid #edf0f8}.picon{width:36px;height:36px;border-radius:11px;background:#edf2ff;display:grid;place-items:center;font-size:18px}.pname{font-weight:800;font-size:13px}.ptype{font-size:11px;color:var(--muted);margin-top:3px}.provider .spacer{flex:1}.event{padding:10px 0;border-bottom:1px solid #edf0f8;font-size:13px;display:flex;gap:10px;align-items:center}.dot{width:9px;height:9px;border-radius:50%;background:#19bd77;flex:none}.hidden{display:none!important}.login{max-width:390px;margin:12vh auto;background:#fff;padding:28px;border-radius:20px;box-shadow:0 15px 45px #14275a20}.login input{width:100%;padding:13px;margin:7px 0;border:1px solid #dce2f0;border-radius:10px}.detailgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.mini{background:#f6f8ff;border-radius:12px;padding:12px}.mini b{display:block;font-size:19px;margin-top:5px}.empty{padding:25px;text-align:center;color:var(--muted)}@media(max-width:1050px){.stats{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}}@media(max-width:700px){.shell{grid-template-columns:1fr}.side{position:sticky;top:0;z-index:5;padding:9px;display:flex;flex-direction:row;overflow-x:auto;align-items:center}.logo{padding:4px 10px;margin:0;border:0;min-width:90px}.logo .coin,.logo span{display:none}.logo b{font-size:15px}.navbtn{white-space:nowrap;padding:10px;font-size:12px}.navbtn i{width:auto}.logout{margin:0}.main{padding:15px 12px 30px}.top{margin-bottom:15px}.search{width:100%;min-width:0}.admin{display:none}.stats{gap:9px}.stat{padding:13px;border-radius:14px}.stat strong{font-size:21px}.card{padding:14px;border-radius:14px}.pagehead h1{font-size:21px}.detailgrid{grid-template-columns:1fr 1fr}}
+</style></head><body><div id="app"><div class="login"><h2>CoinCove Admin</h2><p>Secure administrator sign in</p><input id="adminUser" placeholder="Admin username" autocomplete="username"><input id="adminPass" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" style="width:100%;padding:13px" onclick="doLogin()">Sign in</button></div></div>
 <script>
-const storage={
- get(k){try{return window.localStorage.getItem(k)||''}catch(e){console.warn('Storage read failed:',e);return ''}},
- set(k,v){try{window.localStorage.setItem(k,v)}catch(e){console.warn('Storage write failed:',e)}},
- remove(k){try{window.localStorage.removeItem(k)}catch(e){console.warn('Storage remove failed:',e)}}
-};
-let token=storage.get('cc_admin_token');
+const storage={get(k){try{return localStorage.getItem(k)||''}catch{return''}},set(k,v){try{localStorage.setItem(k,v)}catch{}},remove(k){try{localStorage.removeItem(k)}catch{}}};let token=storage.get('cc_admin_token'),cache={};
 const esc=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
-async function api(p,o={}){
- const headers=Object.assign({'Content-Type':'application/json'},o.headers||{},token?{'Authorization':'Bearer '+token}:{});
- const controller=new AbortController();
- const timeout=setTimeout(()=>controller.abort(),15000);
- try{
-   const r=await fetch(p,Object.assign({},o,{headers,signal:controller.signal}));
-   let d;try{d=await r.json()}catch{d={success:false,message:'Server response was invalid.'}}
-   if(!r.ok&&!d.message)d.message='Request failed ('+r.status+').';
-   return d;
- }catch(e){
-   return {success:false,code:e?.name==='AbortError'?'TIMEOUT':'NETWORK_ERROR',message:e?.name==='AbortError'?'The server took too long to respond.':'Unable to connect to the server.'};
- }finally{clearTimeout(timeout)}
-}
-async function boot(){
- try{
-   const m=await api('/api/admin/me');
-   if(!m.success){login();return}
-   dash();
- }catch(e){
-   document.getElementById('app').innerHTML='<div class="card"><h2>Unable to load Admin</h2><p>'+esc(e?.message||'Unexpected error.')+'</p><button class="btn" onclick="location.reload()">Retry</button></div>';
- }
-}
-function login(){document.getElementById('app').innerHTML='<div class="card"><h2>Coin Cove Admin</h2><input id="adminUser" class="input" placeholder="Admin Username" autocomplete="username"><input id="adminPass" class="input" type="password" placeholder="Admin Password" autocomplete="current-password"><button class="btn" style="margin-top:10px" onclick="doLogin()">Login</button></div>'}
-async function doLogin(){const username=document.getElementById('adminUser')?.value.trim()||'';const password=document.getElementById('adminPass')?.value||'';if(!username||!password){alert('Enter admin username and password.');return}const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username,password})});if(!d.success)return alert(d.message||'Admin login failed.');token=d.token;storage.set('cc_admin_token',token);dash()}
-async function dash(){const [us,ws,ns]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals'),api('/api/admin/network-events')]);if(!us.success||!ws.success||!ns.success){document.getElementById('app').innerHTML='<div class="card"><h2>Admin data could not be loaded</h2><p>'+esc(us.message||ws.message||'Please try again.')+'</p><button class="btn" onclick="dash()">Retry</button><button class="btn secondary" style="margin-top:8px" onclick="logout()">Back to login</button></div>';return}document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Telegram Bot</h3><p>Connect the bot webhook so /start opens Coin Cove in Telegram.</p><button class="btn" onclick="setupTelegram()">Connect Telegram Bot</button><span id="tgSetupStatus" class="small" style="margin-left:8px"></span></div><div class="card"><h3>Users</h3><table><tr><th>User ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+esc(x.public_id||'—')+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>VPN / Proxy Detection</h3><p>Blocked connection attempts. If a visitor was not signed in, account fields are shown as Unknown.</p><table><tr><th>Date</th><th>User ID</th><th>Email</th><th>IP Address</th><th>Detection</th><th>Status</th></tr>'+(ns.events||[]).map(x=>'<tr><td>'+new Date(Number(x.created_at||0)).toLocaleString()+'</td><td>'+esc(x.public_id||'Unknown / Guest')+'</td><td>'+esc(x.email||'—')+'</td><td>'+esc(x.ip||'')+'</td><td>'+esc(x.detection_type||'')+'</td><td>'+(x.blocked?'Blocked':'Flagged')+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(Number(x.usd_cents||0)/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\'approve\')">Approve</button> <button class="btn danger" onclick="act('+x.id+',\'reject\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}
-async function setupTelegram(){const el=document.getElementById('tgSetupStatus');if(el)el.textContent='Connecting...';const d=await api('/api/admin/telegram/setup',{method:'POST'});if(el)el.textContent=d.success?'Connected':'Failed';alert(d.message||d.description||(d.success?'Telegram webhook connected.':'Telegram setup failed.'));}
-async function act(id,a){const d=await api('/api/admin/withdrawal',{method:'POST',body:JSON.stringify({id,action:a})});alert(d.message||'Done');dash()}
+async function api(p,o={}){try{const r=await fetch(p,{...o,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{}),...(o.headers||{})}});let d;try{d=await r.json()}catch{d={success:false,message:'Invalid server response'}}return d}catch(e){return{success:false,message:'Connection error'}}}
+async function boot(){const m=await api('/api/admin/me');if(m.success)dash();else login()}
+function login(){document.getElementById('app').innerHTML='<div class="login"><div class="coin">👑</div><h2>CoinCove Admin</h2><p class="sub">Secure administrator sign in</p><input id="adminUser" placeholder="Admin username" autocomplete="username"><input id="adminPass" type="password" placeholder="Password" autocomplete="current-password"><button class="btn" style="width:100%;padding:13px" onclick="doLogin()">Sign in</button></div>'}
+async function doLogin(){let username=document.getElementById('adminUser').value.trim(),password=document.getElementById('adminPass').value;if(!username||!password)return alert('Enter username and password');let d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username,password})});if(!d.success)return alert(d.message||'Login failed');token=d.token;storage.set('cc_admin_token',token);dash()}
+async function load(){let [o,u,w,n,p]=await Promise.all([api('/api/admin/overview'),api('/api/admin/users'),api('/api/admin/withdrawals'),api('/api/admin/network-events'),api('/api/admin/providers')]);cache={overview:o,users:u,withdrawals:w,network:n,providers:p};return Object.values(cache).every(x=>x.success)}
+async function dash(){if(!(await load())){document.getElementById('app').innerHTML='<div class="login"><h2>Unable to load dashboard</h2><p>Please retry.</p><button class="btn" onclick="dash()">Retry</button></div>';return}document.getElementById('app').innerHTML=`<div class="shell"><aside class="side"><div class="logo"><div class="coin">👑</div><b>CoinCove</b><span>ADMIN PANEL</span></div><button class="navbtn active" onclick="page('dashboard',this)"><i>⌂</i>Dashboard</button><button class="navbtn" onclick="page('users',this)"><i>♟</i>Users</button><button class="navbtn" onclick="page('companies',this)"><i>▦</i>Companies</button><button class="navbtn" onclick="page('offers',this)"><i>✦</i>Completed Offers</button><button class="navbtn" onclick="page('security',this)"><i>◈</i>VPN / Proxy Logs</button><button class="navbtn" onclick="page('withdrawals',this)"><i>⇄</i>Withdrawals</button><button class="navbtn" onclick="page('activity',this)"><i>▤</i>Transactions</button><button class="navbtn" onclick="setupTelegram()"><i>✈</i>Telegram Bot</button><button class="navbtn logout" onclick="logout()"><i>⇥</i>Logout</button></aside><main class="main"><header class="top"><input class="search" id="globalSearch" placeholder="Search users, emails, or IDs…" oninput="filterTables(this.value)"><div class="admin">🟢 Online　 Admin</div></header><div id="content"></div></main></div>`;page('dashboard',document.querySelector('.navbtn.active'))}
+function stat(label,value,icon){return `<div class="stat"><label>${icon}　${label}</label><strong>${value}</strong></div>`}
+function tableUsers(rows){return `<div class="tablewrap"><table id="usersTable"><thead><tr><th>User ID</th><th>Email / Telegram</th><th>Balance</th><th>Earned</th><th>Withdrawn</th><th>Details</th></tr></thead><tbody>${rows.map(x=>`<tr><td><b>${esc(x.public_id||'—')}</b></td><td>${esc(x.email||x.telegram_id||'—')}</td><td>${Number(x.balance).toLocaleString()}</td><td>${Number(x.lifetime_earned).toLocaleString()}</td><td>${Number(x.lifetime_withdrawn).toLocaleString()}</td><td><button class="btn light" onclick="userDetail(${x.id})">View</button></td></tr>`).join('')}</tbody></table></div>`}
+function page(name,el){document.querySelectorAll('.navbtn').forEach(x=>x.classList.remove('active'));if(el)el.classList.add('active');let c=document.getElementById('content'),o=cache.overview||{},s=o.stats||{};if(name==='dashboard'){c.innerHTML=`<div class="pagehead"><div><h1>Dashboard Overview</h1><div class="sub">Monitor CoinCove performance and activity</div></div><button class="btn" onclick="dash()">↻ Refresh</button></div><div class="stats">${stat('Total Users',s.users||0,'👥')}${stat('Completed Offers',s.offers||0,'✓')}${stat('Approved Withdrawals','$'+(s.withdrawnUsd||'0.00'),'▣')}${stat('Blocked VPN / Proxy',s.blocked||0,'◈')}</div><div class="layout"><section><div class="card"><div class="cardhead"><h2>Users Overview</h2><button class="btn light" onclick="page('users')">View all →</button></div>${tableUsers((cache.users.users||[]).slice(0,6))}</div><div class="card"><div class="cardhead"><h2>Recent Activity</h2><button class="btn light" onclick="page('activity')">View all</button></div>${(o.activities||[]).map(x=>`<div class="event"><span class="dot"></span><span><b>${esc(x.description||x.type)}</b><br><small>${esc(x.public_id||'User')} · ${new Date(Number(x.created_at)*1000).toLocaleString()}</small></span><b style="margin-left:auto">${Number(x.amount)>0?'+':''}${Number(x.amount)}</b></div>`).join('')||'<div class="empty">No recent activity</div>'}</div></section><section><div class="card"><div class="cardhead"><h2>Company Management</h2><button class="btn light" onclick="page('companies')">Manage</button></div>${providerRows()}</div><div class="card"><div class="cardhead"><h2>VPN / Proxy Detection</h2><button class="btn light" onclick="page('security')">View all →</button></div>${(cache.network.events||[]).slice(0,5).map(x=>`<div class="event"><span class="dot" style="background:#ed4660"></span><span><b>${esc(x.detection_type)} · Blocked</b><br><small>${esc(x.public_id||'Guest')} · ${esc(x.ip)}</small></span></div>`).join('')||'<div class="empty">No blocked attempts</div>'}</div></section></div>`}
+else if(name==='users'){c.innerHTML=`<div class="pagehead"><div><h1>Users Management</h1><div class="sub">Balances, account identifiers and user activity</div></div><button class="btn" onclick="dash()">Refresh</button></div><div class="card">${tableUsers(cache.users.users||[])}</div>`}
+else if(name==='companies'){c.innerHTML=`<div class="pagehead"><div><h1>Company Management</h1><div class="sub">Hide a company from the user offerwall without deleting its settings or postback integration.</div></div></div><div class="card">${providerRows(true)}</div>`}
+else if(name==='security'){c.innerHTML=`<div class="pagehead"><div><h1>VPN / Proxy Logs</h1><div class="sub">Blocked network attempts associated with accounts when available.</div></div></div><div class="card"><div class="tablewrap"><table><thead><tr><th>Date</th><th>User ID</th><th>Email</th><th>IP Address</th><th>Detection</th><th>Status</th></tr></thead><tbody>${(cache.network.events||[]).map(x=>`<tr><td>${new Date(Number(x.created_at)*1000).toLocaleString()}</td><td>${esc(x.public_id||'Guest')}</td><td>${esc(x.email||'—')}</td><td>${esc(x.ip)}</td><td>${esc(x.detection_type)}</td><td><span class="pill off">Blocked</span></td></tr>`).join('')}</tbody></table></div></div>`}
+else if(name==='withdrawals'){c.innerHTML=`<div class="pagehead"><div><h1>Withdrawals</h1><div class="sub">Review and process payout requests</div></div></div><div class="card"><div class="tablewrap"><table><thead><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr></thead><tbody>${(cache.withdrawals.withdrawals||[]).map(x=>`<tr><td>${x.id}</td><td>${esc(x.email||x.telegram_id||'')}</td><td>${esc(x.method)}</td><td>${x.coins}</td><td>$${(Number(x.usd_cents)/100).toFixed(2)}</td><td>${esc(x.status)}</td><td>${x.status==='pending'?`<button class="btn" onclick="act(${x.id},'approve')">Approve</button> <button class="btn red" onclick="act(${x.id},'reject')">Reject</button>`:'—'}</td></tr>`).join('')}</tbody></table></div></div>`}
+else if(name==='offers'||name==='activity'){let tx=(o.activities||[]);c.innerHTML=`<div class="pagehead"><div><h1>${name==='offers'?'Completed Offers':'Transactions'}</h1><div class="sub">Reward ledger and provider conversion history</div></div></div><div class="card"><div class="tablewrap"><table><thead><tr><th>User</th><th>Activity</th><th>Type</th><th>Points</th><th>Date</th></tr></thead><tbody>${tx.map(x=>`<tr><td>${esc(x.public_id||'—')}</td><td>${esc(x.description||'')}</td><td>${esc(x.type)}</td><td>${x.amount}</td><td>${new Date(Number(x.created_at)*1000).toLocaleString()}</td></tr>`).join('')}</tbody></table></div><div class="sub">Dashboard shows the latest eight ledger entries. Open a user's details for their full transaction and offer conversion history.</div></div>`}}
+function providerRows(full=false){return (cache.providers.providers||[]).map(x=>`<div class="provider"><div class="picon">${({tapjoy:'⚡',ogads:'🟣',cpidroid:'🎯',notik:'🎮',admantum:'🚀',offerwallgg:'💎',adswed:'🟢',offerme:'🪙',gaintwall:'🌟',bitlabs:'🧪'})[x.key]||'▦'}</div><div><div class="pname">${esc(x.name)}</div><div class="ptype">${esc(x.type)}</div></div><span class="spacer"></span><span class="pill ${x.enabled?'':'off'}">${x.enabled?'Active':'Hidden'}</span><button class="btn ${x.enabled?'red':'light'}" onclick="toggleProvider('${x.key}',${!x.enabled})">${x.enabled?'Hide':'Show'}</button></div>`).join('')}
+async function toggleProvider(key,enabled){let d=await api('/api/admin/providers',{method:'POST',body:JSON.stringify({key,enabled})});if(!d.success)return alert(d.message||'Could not update company');await dash();page('companies',document.querySelectorAll('.navbtn')[2])}
+async function userDetail(id){let d=await api('/api/admin/user-detail?id='+encodeURIComponent(id));if(!d.success)return alert(d.message||'Could not load user');let u=d.user;document.getElementById('content').innerHTML=`<div class="pagehead"><div><h1>User Details</h1><div class="sub">${esc(u.public_id)} · ${esc(u.email||u.telegram_id||'')}</div></div><button class="btn light" onclick="page('users')">← Back</button></div><div class="card"><div class="detailgrid"><div class="mini">Balance<b>${Number(u.balance).toLocaleString()}</b></div><div class="mini">Lifetime earned<b>${Number(u.lifetime_earned).toLocaleString()}</b></div><div class="mini">Lifetime withdrawn<b>${Number(u.lifetime_withdrawn).toLocaleString()}</b></div></div></div><div class="card"><h2>Completed Offers</h2><div class="tablewrap"><table><tr><th>Offer</th><th>Offer ID</th><th>Reward</th><th>Payout</th><th>Status</th><th>Date</th></tr>${d.offers.map(x=>`<tr><td>${esc(x.offer_name||'Offer')}</td><td>${esc(x.offer_id||'—')}</td><td>${x.amount}</td><td>$${Number(x.payout_usd||0).toFixed(2)}</td><td>${esc(x.status)}</td><td>${new Date(Number(x.created_at)*1000).toLocaleString()}</td></tr>`).join('')}</table></div></div><div class="card"><h2>Transactions</h2><div class="tablewrap"><table><tr><th>Description</th><th>Type</th><th>Points</th><th>Date</th></tr>${d.transactions.map(x=>`<tr><td>${esc(x.description||'')}</td><td>${esc(x.type)}</td><td>${x.amount}</td><td>${new Date(Number(x.created_at)*1000).toLocaleString()}</td></tr>`).join('')}</table></div></div>`}
+function filterTables(q){q=q.toLowerCase();document.querySelectorAll('tbody tr').forEach(r=>r.style.display=r.innerText.toLowerCase().includes(q)?'':'none')}
+async function setupTelegram(){let d=await api('/api/admin/telegram/setup',{method:'POST'});alert(d.message||d.description||(d.success?'Telegram webhook connected':'Telegram setup failed'))}
+async function act(id,action){let d=await api('/api/admin/withdrawal',{method:'POST',body:JSON.stringify({id,action})});alert(d.success?'Updated':d.message||'Failed');await dash();page('withdrawals',document.querySelectorAll('.navbtn')[5])}
 async function logout(){await api('/api/admin/logout',{method:'POST'});storage.remove('cc_admin_token');token='';login()}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 </script></body></html>`;
