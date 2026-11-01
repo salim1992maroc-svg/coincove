@@ -910,6 +910,22 @@ async function initSchema(db) {
   }
 
   await ensureColumns(db, "users", { public_id: "TEXT" });
+
+  // Upgrade installations where network_security_events was created by an older
+  // build. CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+  // The admin dashboard reads public_id and email from this table, so missing
+  // legacy columns would make /api/admin/network-events fail and block the
+  // entire dashboard load.
+  await ensureColumns(db, "network_security_events", {
+    user_id: "INTEGER",
+    public_id: "TEXT",
+    email: "TEXT",
+    ip: "TEXT",
+    detection_type: "TEXT",
+    blocked: "INTEGER NOT NULL DEFAULT 1",
+    created_at: "INTEGER"
+  });
+
   try {
     await db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_public_id ON users(public_id)").run();
   } catch (e) {
