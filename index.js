@@ -1,5 +1,5 @@
 const APP_NAME = "Coin Cove";
-const BUILD_VERSION = "2026-11-01-ogads-proxycheck-v3-public-admin-id";
+const BUILD_VERSION = "2026-11-01-proxycheck-admin-audit-v1";
 const TAPJOY_SDK_KEY = "277Mt0yeQyuT_sZLoCUE_gEC0KXJGsauFETqGFqtLDz4ZQ0B_sGMBmpWRx1y";
 const TAPJOY_PLACEMENT = "coincover";
 const POINTS_NAME = "Coins";
@@ -103,6 +103,7 @@ export default {
       if (url.pathname === "/api/admin/logout") return adminLogout(request, env);
       if (url.pathname === "/api/admin/me") return adminMe(request, env);
       if (url.pathname === "/api/admin/users") return adminUsers(request, env);
+      if (url.pathname === "/api/admin/network-events") return adminNetworkEvents(request, env);
       if (url.pathname === "/api/admin/withdrawals") return adminWithdrawals(request, env);
       if (url.pathname === "/api/admin/withdrawal") return adminWithdrawalAction(request, env);
       if (url.pathname === "/api/admin/telegram/setup") return telegramSetup(request, env);
@@ -188,6 +189,26 @@ async function checkVisitorNetwork(request, env) {
 
     const blocked = reasons.length > 0;
     const result = { blocked, reason: blocked ? reasons.join(", ") : "clear" };
+
+    // Record blocked attempts for the admin dashboard. Resolve an account only
+    // when a valid email session or Telegram initData is present.
+    if (blocked && env.DB) {
+      try {
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS network_security_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, public_id TEXT, email TEXT,
+          ip TEXT NOT NULL, detection_type TEXT NOT NULL, blocked INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL
+        )`).run();
+        const identity = await resolveUserAuth(request, env);
+        let user = identity ? await dbUserByDatabaseId(env.DB, identity.userId) : null;
+        await env.DB.prepare(`
+          INSERT INTO network_security_events(user_id,public_id,email,ip,detection_type,blocked,created_at)
+          VALUES(?,?,?,?,?,1,?)
+        `).bind(user?.id || null, user?.public_id || null, user?.email || null, ip, result.reason, Date.now()).run();
+      } catch (logError) {
+        console.error("Network security event logging failed:", logError);
+      }
+    }
 
     try {
       if (typeof caches !== "undefined" && caches.default) {
@@ -834,6 +855,9 @@ async function initSchema(db) {
     `CREATE TABLE IF NOT EXISTS email_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS admin_users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, created_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS admin_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS network_security_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, public_id TEXT, email TEXT, ip TEXT NOT NULL, detection_type TEXT NOT NULL, blocked INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS idx_network_events_created ON network_security_events(created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_network_events_ip ON network_security_events(ip,created_at)`,
     `CREATE TABLE IF NOT EXISTS withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, method TEXT NOT NULL, destination TEXT NOT NULL, coins INTEGER NOT NULL, usd_cents INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, admin_note TEXT)`,
     `CREATE TABLE IF NOT EXISTS offerwall_conversions (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_id TEXT NOT NULL UNIQUE, user_id INTEGER NOT NULL, amount INTEGER NOT NULL, status TEXT NOT NULL, offer_id TEXT, offer_name TEXT, goal_id TEXT, payout_usd REAL DEFAULT 0, test INTEGER DEFAULT 0, created_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS monetag_postbacks (id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT NOT NULL UNIQUE, ymid TEXT NOT NULL, telegram_id TEXT NOT NULL, user_id INTEGER NOT NULL, event_type TEXT, reward_event_type TEXT, zone_id TEXT NOT NULL, estimated_price REAL, reward_date TEXT NOT NULL, rewarded INTEGER NOT NULL, created_at INTEGER NOT NULL)`,
@@ -1909,6 +1933,17 @@ async function adminUsers(request, env) {
   return json({ success: true, users: r.results || [] });
 }
 
+async function adminNetworkEvents(request, env) {
+  if (request.method !== "GET") return json({ success: false, message: "Method not allowed." }, 405);
+  await ensureSchema(env);
+  if (!(await adminSession(env.DB, request))) return json({ success: false, message: "Not authenticated." }, 401);
+  const r = await env.DB.prepare(`
+    SELECT id,user_id,public_id,email,ip,detection_type,blocked,created_at
+    FROM network_security_events ORDER BY id DESC LIMIT 300
+  `).all();
+  return json({ success: true, events: r.results || [] });
+}
+
 async function adminWithdrawals(request, env) {
   if (request.method !== "GET") return json({ success: false, message: "Method not allowed." }, 405);
   await ensureSchema(env);
@@ -2603,7 +2638,7 @@ async function boot(){
 }
 function login(){document.getElementById('app').innerHTML='<div class="card"><h2>Coin Cove Admin</h2><input id="adminUser" class="input" placeholder="Admin Username" autocomplete="username"><input id="adminPass" class="input" type="password" placeholder="Admin Password" autocomplete="current-password"><button class="btn" style="margin-top:10px" onclick="doLogin()">Login</button></div>'}
 async function doLogin(){const username=document.getElementById('adminUser')?.value.trim()||'';const password=document.getElementById('adminPass')?.value||'';if(!username||!password){alert('Enter admin username and password.');return}const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username,password})});if(!d.success)return alert(d.message||'Admin login failed.');token=d.token;storage.set('cc_admin_token',token);dash()}
-async function dash(){const [us,ws]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals')]);if(!us.success||!ws.success){document.getElementById('app').innerHTML='<div class="card"><h2>Admin data could not be loaded</h2><p>'+esc(us.message||ws.message||'Please try again.')+'</p><button class="btn" onclick="dash()">Retry</button><button class="btn secondary" style="margin-top:8px" onclick="logout()">Back to login</button></div>';return}document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Telegram Bot</h3><p>Connect the bot webhook so /start opens Coin Cove in Telegram.</p><button class="btn" onclick="setupTelegram()">Connect Telegram Bot</button><span id="tgSetupStatus" class="small" style="margin-left:8px"></span></div><div class="card"><h3>Users</h3><table><tr><th>User ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+esc(x.public_id||'—')+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(Number(x.usd_cents||0)/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\'approve\')">Approve</button> <button class="btn danger" onclick="act('+x.id+',\'reject\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}
+async function dash(){const [us,ws,ns]=await Promise.all([api('/api/admin/users'),api('/api/admin/withdrawals'),api('/api/admin/network-events')]);if(!us.success||!ws.success||!ns.success){document.getElementById('app').innerHTML='<div class="card"><h2>Admin data could not be loaded</h2><p>'+esc(us.message||ws.message||'Please try again.')+'</p><button class="btn" onclick="dash()">Retry</button><button class="btn secondary" style="margin-top:8px" onclick="logout()">Back to login</button></div>';return}document.getElementById('app').innerHTML='<h2>Coin Cove Admin</h2><div class="card"><h3>Telegram Bot</h3><p>Connect the bot webhook so /start opens Coin Cove in Telegram.</p><button class="btn" onclick="setupTelegram()">Connect Telegram Bot</button><span id="tgSetupStatus" class="small" style="margin-left:8px"></span></div><div class="card"><h3>Users</h3><table><tr><th>User ID</th><th>Email</th><th>Telegram</th><th>Balance</th><th>Earned</th></tr>'+(us.users||[]).map(x=>'<tr><td>'+esc(x.public_id||'—')+'</td><td>'+esc(x.email||'')+'</td><td>'+esc(x.telegram_id||'')+'</td><td>'+x.balance+'</td><td>'+x.lifetime_earned+'</td></tr>').join('')+'</table></div><div class="card"><h3>VPN / Proxy Detection</h3><p>Blocked connection attempts. If a visitor was not signed in, account fields are shown as Unknown.</p><table><tr><th>Date</th><th>User ID</th><th>Email</th><th>IP Address</th><th>Detection</th><th>Status</th></tr>'+(ns.events||[]).map(x=>'<tr><td>'+new Date(Number(x.created_at||0)).toLocaleString()+'</td><td>'+esc(x.public_id||'Unknown / Guest')+'</td><td>'+esc(x.email||'—')+'</td><td>'+esc(x.ip||'')+'</td><td>'+esc(x.detection_type||'')+'</td><td>'+(x.blocked?'Blocked':'Flagged')+'</td></tr>').join('')+'</table></div><div class="card"><h3>Withdrawals</h3><table><tr><th>ID</th><th>User</th><th>Method</th><th>Coins</th><th>USD</th><th>Status</th><th>Action</th></tr>'+(ws.withdrawals||[]).map(x=>'<tr><td>'+x.id+'</td><td>'+esc(x.email||x.telegram_id||'')+'</td><td>'+x.method+'</td><td>'+x.coins+'</td><td>$'+(Number(x.usd_cents||0)/100).toFixed(2)+'</td><td>'+x.status+'</td><td>'+(x.status==='pending'?'<button class="btn" onclick="act('+x.id+',\'approve\')">Approve</button> <button class="btn danger" onclick="act('+x.id+',\'reject\')">Reject</button>':'')+'</td></tr>').join('')+'</table></div><button class="btn" onclick="logout()">Logout</button>'}
 async function setupTelegram(){const el=document.getElementById('tgSetupStatus');if(el)el.textContent='Connecting...';const d=await api('/api/admin/telegram/setup',{method:'POST'});if(el)el.textContent=d.success?'Connected':'Failed';alert(d.message||d.description||(d.success?'Telegram webhook connected.':'Telegram setup failed.'));}
 async function act(id,a){const d=await api('/api/admin/withdrawal',{method:'POST',body:JSON.stringify({id,action:a})});alert(d.message||'Done');dash()}
 async function logout(){await api('/api/admin/logout',{method:'POST'});storage.remove('cc_admin_token');token='';login()}
@@ -2626,7 +2661,7 @@ function renderLegalPage(kind) {
       <li><b>Account details:</b> email address for website accounts, and Telegram account identifiers and profile details made available to the Mini App.</li>
       <li><b>Account activity:</b> Coin balances, rewards, offer completion records, referral activity, transaction history, and withdrawal requests.</li>
       <li><b>Withdrawal details:</b> the payment method and destination you submit when requesting a withdrawal.</li>
-      <li><b>Technical and security data:</b> information included in requests or provider callbacks that is needed to operate the service, prevent abuse, and troubleshoot errors.</li></ul>
+      <li><b>Technical and security data:</b> IP address, connection classification (such as VPN, proxy, or Tor when detected), request details, and security-event records used to prevent abuse and investigate blocked access.</li></ul>
     <h2>How we use information</h2><p>We use this information to create and secure accounts, display balances, record rewards and reversals, process withdrawal requests, provide support, detect fraud or duplicate activity, and operate and improve Coin Cove.</p>
     <h2>Offerwalls and advertising partners</h2><p>When you open an offerwall or interact with an advertisement, the relevant third-party provider may receive identifiers and activity data needed to attribute offers, measure events, apply its own rules, and validate rewards. Those providers process data under their own privacy policies. Coin Cove cannot control the independent practices of third-party services.</p>
     <h2>Sharing and disclosure</h2><p>We may share the minimum information needed with offerwall, advertising, hosting, database, and payment-related service providers to operate Coin Cove; and when reasonably necessary to protect users, investigate abuse, enforce our terms, or comply with applicable law. We do not intend to sell personal information.</p>
