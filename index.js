@@ -31,10 +31,8 @@ export default {
     try {
       const url = new URL(request.url);
 
-      // VPN/proxy enforcement is account-aware for email/password users.
-      // Let visitors reach registration/login first; those handlers validate credentials,
-      // then run the network check with the known user ID before issuing a session.
-      // Telegram users are intentionally not part of this enforcement flow.
+      // Enforce network reputation and the account's first trusted IP on every
+      // authenticated user request. Admin and provider callbacks stay isolated.
       const networkExempt = url.pathname === "/api/health" || url.pathname === "/admin" ||
         url.pathname === "/api/auth/register" || url.pathname === "/api/auth/login" ||
         url.pathname === "/api/auth/logout" || url.pathname === "/api/auth/me" ||
@@ -45,14 +43,24 @@ export default {
         (url.pathname === "/" && ["subId", "transId", "reward", "signature"].every(k => url.searchParams.has(k)));
       if (!networkExempt) {
         const identity = await resolveUserAuth(request, env);
-        if (identity?.auth === "email") {
+        if (identity) {
+          await ensureSchema(env);
           const account = await dbUserByDatabaseId(env.DB, identity.userId);
-          const networkCheck = await checkVisitorNetwork(request, env, account);
-          if (networkCheck.blocked) {
-            // Revoke all email sessions for this account so a blocked user is logged out.
-            await env.DB.prepare("DELETE FROM email_sessions WHERE user_id=?").bind(identity.userId).run();
-            return new Response(renderNetworkBlockedPage(networkCheck.reason), {
-              status: 403,
+          const ipCheck = await enforceAccountIp(request, env, account);
+          if (!ipCheck.ok) {
+            if (identity.auth === "email") {
+              await env.DB.prepare("DELETE FROM email_sessions WHERE user_id=?").bind(identity.userId).run();
+            }
+            return new Response(renderNetworkBlockedPage(ipCheck.reason), {
+              status: ipCheck.unavailable ? 503 : 403,
+              headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" }
+            });
+          }
+          const reputation = await checkVisitorNetwork(request, env, account);
+          if (reputation.unavailable || reputation.blocked) {
+            if (identity.auth === "email") await env.DB.prepare("DELETE FROM email_sessions WHERE user_id=?").bind(identity.userId).run();
+            return new Response(renderNetworkBlockedPage(reputation.reason), {
+              status: reputation.unavailable ? 503 : 403,
               headers: { "content-type": "text/html;charset=UTF-8", "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" }
             });
           }
@@ -149,12 +157,9 @@ export default {
 
 async function checkVisitorNetwork(request, env, knownUser = null) {
   const apiKey = String(env.PROXYCHECK_API_KEY || "").trim();
-  // Detection is activated only after the owner adds PROXYCHECK_API_KEY as a Worker Secret.
-  if (!apiKey) return { blocked: false, reason: "not_configured" };
-
-  // Trust only Cloudflare's client-IP header; never trust arbitrary X-Forwarded-For.
   const ip = String(request.headers.get("CF-Connecting-IP") || "").trim();
-  if (!ip || ip.length > 64) return { blocked: false, reason: "ip_unavailable" };
+  if (!ip || ip.length > 64) return { blocked: false, unavailable: true, reason: "Unable to identify your network IP. Please retry." };
+  if (!apiKey) return { blocked: false, unavailable: true, reason: "Security verification is not configured. Please contact Coin Cove support." };
 
   const cacheKey = new Request("https://coin-cove-proxycheck-cache.invalid/" + encodeURIComponent(ip));
   try {
@@ -162,39 +167,25 @@ async function checkVisitorNetwork(request, env, knownUser = null) {
       const cached = await caches.default.match(cacheKey);
       if (cached) {
         const result = await cached.json();
-        if (result.blocked) await logNetworkSecurityEvent(env, request, ip, result.reason || "cached_detection", knownUser);
-        return { blocked: !!result.blocked, reason: result.reason || "cached_detection" };
+        if (result.blocked) await logNetworkSecurityEvent(env, request, ip, result.reason || "VPN/Proxy", knownUser);
+        return { ...result, unavailable: false };
       }
     }
-  } catch (e) {
-    console.warn("ProxyCheck cache read failed:", e);
-  }
+  } catch (e) { console.warn("ProxyCheck cache read failed:", e); }
 
   try {
-    // ProxyCheck v2 is the documented stable endpoint and supports the free API key.
-    // vpn=1 checks both proxy and VPN; the response also identifies TOR/OpenVPN types.
     const endpoint = new URL("https://proxycheck.io/v2/" + encodeURIComponent(ip));
     endpoint.searchParams.set("key", apiKey);
     endpoint.searchParams.set("vpn", "1");
     endpoint.searchParams.set("tag", "CoinCove");
-
     const response = await fetch(endpoint.toString(), {
-      method: "GET",
-      headers: { "accept": "application/json" },
-      signal: AbortSignal.timeout(5000)
+      method: "GET", headers: { "accept": "application/json" }, signal: AbortSignal.timeout(7000)
     });
     if (!response.ok) throw new Error("ProxyCheck HTTP " + response.status);
     const data = await response.json();
-    if (!data || !["ok", "warning"].includes(String(data.status || "").toLowerCase())) {
-      throw new Error("ProxyCheck lookup was unsuccessful");
-    }
-
-    // v2 returns the result under the queried IP address.
-    const record = data[ip] || Object.entries(data).find(([key, value]) =>
-      key !== "status" && key !== "query time" && value && typeof value === "object"
-    )?.[1];
-    if (!record || typeof record !== "object") throw new Error("ProxyCheck response had no IP result");
-
+    if (!data || !["ok", "warning"].includes(String(data.status || "").toLowerCase())) throw new Error("ProxyCheck returned an unsuccessful status");
+    const record = data[ip] || Object.entries(data).find(([key, value]) => key !== "status" && key !== "query time" && value && typeof value === "object")?.[1];
+    if (!record || typeof record !== "object") throw new Error("ProxyCheck response did not contain the requested IP");
     const proxy = String(record.proxy || "").toLowerCase() === "yes";
     const type = String(record.type || "").toLowerCase();
     const reasons = [];
@@ -202,29 +193,35 @@ async function checkVisitorNetwork(request, env, knownUser = null) {
     if (proxy && !reasons.includes("VPN")) reasons.push("Proxy");
     if (type === "tor") reasons.push("Tor");
     if (type === "openvpn") reasons.push("OpenVPN");
-
-    const blocked = reasons.length > 0;
-    const result = { blocked, reason: blocked ? reasons.join(", ") : "clear" };
-
-    // Record blocked attempts for the admin dashboard. Resolve an account only
-    // when a valid email session or Telegram initData is present.
-    if (blocked) await logNetworkSecurityEvent(env, request, ip, result.reason, knownUser);
-
-    try {
-      if (typeof caches !== "undefined" && caches.default) {
-        await caches.default.put(cacheKey, new Response(JSON.stringify(result), {
-          headers: { "content-type": "application/json", "cache-control": "public, max-age=900" }
-        }));
-      }
-    } catch (e) {
-      console.warn("ProxyCheck cache write failed:", e);
+    const result = { blocked: reasons.length > 0, reason: reasons.length ? reasons.join(", ") : "clear" };
+    if (result.blocked) await logNetworkSecurityEvent(env, request, ip, result.reason, knownUser);
+    if (typeof caches !== "undefined" && caches.default) {
+      await caches.default.put(cacheKey, new Response(JSON.stringify(result), {
+        headers: { "content-type": "application/json", "cache-control": "public, max-age=300" }
+      }));
     }
-    return result;
+    return { ...result, unavailable: false };
   } catch (e) {
-    // Fail open on provider/network errors to avoid accidentally locking out all visitors.
-    console.error("ProxyCheck network check failed:", e);
-    return { blocked: false, reason: "check_unavailable" };
+    console.error("ProxyCheck verification failed:", e);
+    return { blocked: false, unavailable: true, reason: "Security verification is temporarily unavailable. Please try again shortly." };
   }
+}
+
+async function enforceAccountIp(request, env, user) {
+  const ip = String(request.headers.get("CF-Connecting-IP") || "").trim();
+  if (!user || !ip || ip.length > 64) return { ok: false, reason: "Unable to verify your account IP. Please contact support." };
+  const current = await env.DB.prepare("SELECT account_ip FROM users WHERE id=? LIMIT 1").bind(user.id).first();
+  const savedIp = String(current?.account_ip || "").trim();
+  if (!savedIp) {
+    // Conditional write prevents two first logins from silently overwriting each other.
+    await env.DB.prepare("UPDATE users SET account_ip=? WHERE id=? AND (account_ip IS NULL OR account_ip='')").bind(ip, user.id).run();
+    const after = await env.DB.prepare("SELECT account_ip FROM users WHERE id=? LIMIT 1").bind(user.id).first();
+    if (String(after?.account_ip || "") === ip) return { ok: true };
+  }
+  if (savedIp && savedIp === ip) return { ok: true };
+  const approved = String(current?.account_ip || "").trim();
+  await logNetworkSecurityEvent(env, request, ip, "Account IP changed (expected " + (approved || "another IP") + ")", user);
+  return { ok: false, reason: "Your account IP address has changed. You have been signed out. Please reconnect using your previously registered IP address. Contact support if your IP changed permanently." };
 }
 
 
@@ -251,8 +248,8 @@ async function logNetworkSecurityEvent(env, request, ip, detectionType, knownUse
 }
 
 function renderNetworkBlockedPage(reason) {
-  const detail = String(reason || "VPN, Proxy, or Tor connection").replace(/[<>]/g, "");
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Access Restricted — Coin Cove</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;box-sizing:border-box;background:#071126;color:#f4f7ff;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.card{max-width:520px;padding:32px;border:1px solid rgba(106,151,255,.25);border-radius:24px;background:#102044;text-align:center;box-shadow:0 20px 60px #0005}h1{font-size:27px;margin:0 0 14px}p{color:#b8c7e8;line-height:1.7}.icon{font-size:48px;margin-bottom:14px}.small{font-size:13px;color:#8499c5}</style></head><body><main class="card"><div class="icon">🛡️</div><h1>Access Restricted</h1><p>Coin Cove does not allow access through VPN, proxy, or Tor connections. Please turn off your VPN or proxy and try again using your normal internet connection.</p><p class="small">Connection classification: ${detail}</p></main></body></html>`;
+  const detail = String(reason || "Network verification failed").replace(/[<>]/g, "");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Connection blocked — Coin Cove</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;box-sizing:border-box;background:#071126;color:#f4f7ff;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.card{max-width:520px;padding:32px;border:1px solid rgba(106,151,255,.25);border-radius:24px;background:#102044;text-align:center;box-shadow:0 20px 60px #0005}h1{font-size:25px;margin:0 0 14px}p{color:#b8c7e8;line-height:1.8}.icon{font-size:48px;margin-bottom:14px}.small{font-size:13px;color:#8499c5}</style></head><body><main class="card"><div class="icon">🛡️</div><h1>Access temporarily blocked</h1><p>Your connection could not be approved, or your account IP address has changed. Coin Cove has signed you out to protect your account and our offer partners.</p><p>Please disable VPN/proxy/Tor and use your previously registered IP address. If your internet provider changed your IP, contact support before trying again.</p><p class="small">${detail}</p></main></body></html>`;
 }
 
 async function readPostbackParams(request) {
@@ -870,7 +867,7 @@ async function generateUniquePublicUserId(db) {
 
 async function initSchema(db) {
   const stmts = [
-    `CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT UNIQUE, telegram_id TEXT UNIQUE, username TEXT, first_name TEXT, last_name TEXT, referral_code TEXT UNIQUE, referred_by TEXT, email TEXT UNIQUE, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT UNIQUE, telegram_id TEXT UNIQUE, username TEXT, first_name TEXT, last_name TEXT, referral_code TEXT UNIQUE, referred_by TEXT, email TEXT UNIQUE, account_ip TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS wallets (user_id INTEGER PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 0, lifetime_earned INTEGER NOT NULL DEFAULT 0, lifetime_withdrawn INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS referrals (id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER NOT NULL, referred_user_id INTEGER NOT NULL UNIQUE, reward INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, type TEXT NOT NULL, amount INTEGER NOT NULL, description TEXT, created_at INTEGER NOT NULL)`,
@@ -909,23 +906,7 @@ async function initSchema(db) {
     if (!m.includes("duplicate column") && !m.includes("already exists")) console.error("users.email migration:", e);
   }
 
-  await ensureColumns(db, "users", { public_id: "TEXT" });
-
-  // Upgrade installations where network_security_events was created by an older
-  // build. CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
-  // The admin dashboard reads public_id and email from this table, so missing
-  // legacy columns would make /api/admin/network-events fail and block the
-  // entire dashboard load.
-  await ensureColumns(db, "network_security_events", {
-    user_id: "INTEGER",
-    public_id: "TEXT",
-    email: "TEXT",
-    ip: "TEXT",
-    detection_type: "TEXT",
-    blocked: "INTEGER NOT NULL DEFAULT 1",
-    created_at: "INTEGER"
-  });
-
+  await ensureColumns(db, "users", { public_id: "TEXT", account_ip: "TEXT" });
   try {
     await db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_public_id ON users(public_id)").run();
   } catch (e) {
@@ -983,6 +964,11 @@ async function apiMe(request, env) {
     if (!td) return json({ success: false, code: "INVALID_INIT_DATA", message: "Invalid Telegram authorization." }, 401);
 
     const user = await getOrCreateTelegramUser(env.DB, td);
+    const networkCheck = await checkVisitorNetwork(request, env, user);
+    if (networkCheck.unavailable) return json({ success: false, code: "NETWORK_CHECK_UNAVAILABLE", message: networkCheck.reason }, 503);
+    if (networkCheck.blocked) return json({ success: false, code: "NETWORK_BLOCKED", message: "VPN, Proxy, and Tor connections are not allowed. Turn off your VPN or proxy and try again." }, 403);
+    const ipCheck = await enforceAccountIp(request, env, user);
+    if (!ipCheck.ok) return json({ success: false, code: "ACCOUNT_IP_CHANGED", message: ipCheck.reason }, 403);
     return userPayload(env.DB, user.id, { auth: "telegram" });
   } catch (e) {
     console.error("apiMe error:", e);
@@ -1734,9 +1720,10 @@ async function emailRegister(request, env) {
   }
 
   const networkCheck = await checkVisitorNetwork(request, env, user);
-  if (networkCheck.blocked) {
-    return json({ success: false, code: "NETWORK_BLOCKED", message: "VPN, Proxy, and Tor connections are not allowed. Turn off your VPN or proxy and try again." }, 403);
-  }
+  if (networkCheck.unavailable) return json({ success: false, code: "NETWORK_CHECK_UNAVAILABLE", message: networkCheck.reason }, 503);
+  if (networkCheck.blocked) return json({ success: false, code: "NETWORK_BLOCKED", message: "VPN, Proxy, and Tor connections are not allowed. Turn off your VPN or proxy and try again." }, 403);
+  const ipCheck = await enforceAccountIp(request, env, user);
+  if (!ipCheck.ok) return json({ success: false, code: "ACCOUNT_IP_CHANGED", message: ipCheck.reason }, 403);
   const token = await createSession(env.DB, user.id);
   return userPayload(env.DB, user.id, { auth: "email", sessionCreated: true, token });
 }
@@ -1759,10 +1746,15 @@ async function emailLogin(request, env) {
 
   const account = await dbUserByDatabaseId(env.DB, row.user_id);
   const networkCheck = await checkVisitorNetwork(request, env, account);
+  if (networkCheck.unavailable) return json({ success: false, code: "NETWORK_CHECK_UNAVAILABLE", message: networkCheck.reason }, 503);
   if (networkCheck.blocked) {
-    // Revoke any previous email sessions as well; do not issue a new one.
     await env.DB.prepare("DELETE FROM email_sessions WHERE user_id=?").bind(row.user_id).run();
     return json({ success: false, code: "NETWORK_BLOCKED", message: "VPN, Proxy, and Tor connections are not allowed. Turn off your VPN or proxy and try again." }, 403);
+  }
+  const ipCheck = await enforceAccountIp(request, env, account);
+  if (!ipCheck.ok) {
+    await env.DB.prepare("DELETE FROM email_sessions WHERE user_id=?").bind(row.user_id).run();
+    return json({ success: false, code: "ACCOUNT_IP_CHANGED", message: ipCheck.reason }, 403);
   }
   const token = await createSession(env.DB, row.user_id);
   return userPayload(env.DB, row.user_id, { auth: "email", sessionCreated: true, token });
@@ -1781,6 +1773,13 @@ async function emailSessionMe(request, env) {
   await ensureSchema(env);
   const uid = await emailSessionUser(env.DB, request);
   if (!uid) return json({ success: false, message: "Not authenticated." }, 401);
+  const user = await dbUserByDatabaseId(env.DB, uid);
+  const ipCheck = await enforceAccountIp(request, env, user);
+  const networkCheck = ipCheck.ok ? await checkVisitorNetwork(request, env, user) : null;
+  if (!ipCheck.ok || networkCheck?.blocked || networkCheck?.unavailable) {
+    await env.DB.prepare("DELETE FROM email_sessions WHERE user_id=?").bind(uid).run();
+    return json({ success: false, code: ipCheck.ok ? (networkCheck?.unavailable ? "NETWORK_CHECK_UNAVAILABLE" : "NETWORK_BLOCKED") : "ACCOUNT_IP_CHANGED", message: ipCheck.ok ? networkCheck.reason : ipCheck.reason }, ipCheck.ok && networkCheck?.unavailable ? 503 : 403);
+  }
   return userPayload(env.DB, uid, { auth: "email" });
 }
 
