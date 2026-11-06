@@ -1,5 +1,5 @@
 const APP_NAME = "Coin Cove";
-const BUILD_VERSION = "2026-11-02-coincove-permanent-network-ban-v1";
+const BUILD_VERSION = "2026-11-06-coincove-gemk-offerwall-v1";
 const TAPJOY_SDK_KEY = "277Mt0yeQyuT_sZLoCUE_gEC0KXJGsauFETqGFqtLDz4ZQ0B_sGMBmpWRx1y";
 const TAPJOY_PLACEMENT = "coincover";
 const POINTS_NAME = "Coins";
@@ -95,6 +95,7 @@ export default {
       if (url.pathname === "/api/offerwall/admantum/postback") return admantumPostback(request, env);
       if (url.pathname === "/api/offerwall/adswed/postback") return adswedPostback(request, env);
       if (url.pathname === "/api/offerwall/bitlabs/postback") return bitlabsPostback(request, env);
+      if (url.pathname === "/api/offerwall/gemk/postback") return gemkPostback(request, env);
       if (url.pathname === "/api/offerwall/upwall/postback") return upwallPostback(request, env);
       if (url.pathname === "/api/offerme/postback") return offermePostback(request, env);
       if (url.pathname === "/api/offerme/launch") return offermeLaunch(request, env);
@@ -704,6 +705,28 @@ async function ogadsPostback(request, env) {
     return new Response("server error", { status: 500 });
   }
   return new Response("ok", { status: 200 });
+}
+
+async function gemkPostback(request, env) {
+  if (!["GET", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
+  if (!env.DB || !String(env.GEMK_POSTBACK_SECRET || "").trim()) {
+    return new Response("server configuration error", { status: 500 });
+  }
+  const params = await readPostbackParams(request);
+  // Gemk names the placement token "password" in its macro reference and "sig" in its example URL.
+  const suppliedToken = (params.get("sig") || params.get("password") || "").trim();
+  if (!suppliedToken) return new Response("missing signature", { status: 400 });
+  params.set("secret", suppliedToken);
+  return processProviderPostback(request, env, "gemk", {
+    params,
+    requiredSecret: String(env.GEMK_POSTBACK_SECRET).trim(),
+    userAliases: ["userid", "user_id", "uid"],
+    transactionAliases: ["txid", "transactionID", "transaction_id"],
+    amountAliases: ["user_amount"],
+    offerIdAliases: ["offer_id"],
+    offerNameAliases: ["offer_name"],
+    payoutUsdAliases: ["payout"]
+  });
 }
 
 async function processProviderPostback(request, env, provider, config) {
@@ -2055,7 +2078,7 @@ async function adminOverview(request, env) {
 const ADMIN_PROVIDERS = [
   ["tapjoy","Tapjoy","Offerwall"],["ogads","OGAds","Offerwall"],["cpidroid","CPIDroid","CPA Offers"],
   ["notik","Notik","Offerwall"],["admantum","AdMantum","Offerwall"],["offerwallgg","Offerwall.GG","Offerwall"],
-  ["adswed","AdswedMedia","Offerwall"],["offerme","Offerwall.me","Offerwall"],["gaintwall","Gaintwall","Offerwall"],["bitlabs","BitLabs","Offers & Surveys"]
+  ["adswed","AdswedMedia","Offerwall"],["offerme","Offerwall.me","Offerwall"],["gaintwall","Gaintwall","Offerwall"],["bitlabs","BitLabs","Offers & Surveys"],["gemk","Gemk","Offerwall"]
 ];
 async function adminProviders(request, env) {
   await ensureSchema(env);
@@ -2633,6 +2656,7 @@ function offersPage(){
  '<button class="offer" data-provider="offerme" onclick="openProvider(\'offerme\')"><strong>🪙 Offerwall.me</strong><span class="small">Open provider wall</span></button>'+
 '<button class="offer" data-provider="gaintwall" onclick="openProvider(\'gaintwall\')"><strong>🌟 Gaintwall</strong><span class="small">Open provider wall</span></button>'+
  '<button class="offer" data-provider="bitlabs" onclick="openProvider(\'bitlabs\')"><strong>🧪 BitLabs</strong><span class="small">Offers, Games & Surveys</span></button>'+
+ '<button class="offer" data-provider="gemk" onclick="openProvider(\'gemk\')"><strong>💠 Gemk</strong><span class="small">Offers, Games & Surveys</span></button>'+
  '</div></div>'+
  '<div class="card" id="ogads-results-card" data-provider="ogads"><div class="close-row"><h2>OGAds Offers</h2><button class="close" onclick="loadOgadsOffers()" data-provider="ogads">↻ Refresh</button></div><div class="small" id="ogads-status">Tap the OGAds card above to load offers matched to your device and location.</div><div class="offer-grid" id="ogads-offers-grid"></div></div>';
 }
@@ -2696,7 +2720,8 @@ async function openProvider(name){
   admantum:'https://www.admantum.com/offers?appid=27938&uid='+uid,
   offerwallgg:'https://offerwall.gg/wall/4c826098db679c99583194371d0eae1b?userId='+uid,
   adswed:'https://adswedmedia.com/offer/'+${JSON.stringify(ADSWED_PUBLIC_KEY)}+'/'+uid,
-  gaintwall:'https://gaintwall.com/offerwall?apiKey='+encodeURIComponent('Rot6cG2croe92zTp1dsVwkeJTHnKfJza')+'&userId='+uid
+  gaintwall:'https://gaintwall.com/offerwall?apiKey='+encodeURIComponent('Rot6cG2croe92zTp1dsVwkeJTHnKfJza')+'&userId='+uid,
+  gemk:'https://wall.gemk.io/?app_id=8559-3095-ecf2-417c&userid='+uid
  };
  if(!urls[name]){alert('This provider is not configured yet.');return}
  window.open(urls[name],'_blank','noopener,noreferrer');
